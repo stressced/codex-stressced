@@ -364,7 +364,7 @@ async function createWindow() {
     height: 900,
     minWidth: 900,
     minHeight: 600,
-    title: "CodexStressCed",
+    title: "Codex Stressced",
     show: false,
     backgroundColor: "#1a1a1a",
     autoHideMenuBar: true,

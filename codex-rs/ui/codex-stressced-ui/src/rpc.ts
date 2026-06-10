@@ -1,5 +1,5 @@
 // src/rpc.ts
-// RPC client that uses Electron preload API (CodexStressCed) instead of direct WebSocket.
+// RPC client that uses the Codex Stressced Electron preload API instead of direct WebSocket.
 
 export type ConnectionState = "connecting" | "connected" | "error" | "closed";
 
@@ -36,7 +36,7 @@ class RpcClient {
 
   init() {
     if (!window.CodexStressCed) {
-      this.setStatus("error", "CodexStressCed API not available (not running in Electron)");
+      this.setStatus("error", "Codex Stressced API not available (not running in Electron)");
       return;
     }
 
@@ -59,7 +59,7 @@ class RpcClient {
 
   rpc<T>(method: string, params?: Record<string, unknown>): Promise<T> {
     if (!window.CodexStressCed) {
-      return Promise.reject(new Error("CodexStressCed API not available"));
+      return Promise.reject(new Error("Codex Stressced API not available"));
     }
     return window.CodexStressCed.rpc(method, params).then((v) => {
       // If main process wrapped an error, throw it so store.ts can catch it.

@@ -1,4 +1,4 @@
-<h1 align="center">CodexStressCed</h1>
+<h1 align="center">Codex Stressced</h1>
 
 <p align="center">
   Local/offline AI coding workflow derived from OpenAI Codex, adapted for llama.cpp and a dedicated desktop UI.
@@ -6,13 +6,45 @@
 
 > This is an independent derivative project based on OpenAI Codex. It is not an official OpenAI product or distribution.
 
-## CodexStressCed Notes
+## Summary
 
-CodexStressCed keeps the upstream Codex source foundation and adds local-first changes for offline inference, including llama.cpp-oriented provider behavior and the Electron UI in `codex-rs/ui/codex-stressced-ui`.
+Codex Stressced keeps the upstream OpenAI Codex source foundation and adapts it for a local-first workflow. The goal is to run a Codex-style coding agent against a local `llama.cpp` server, with no cloud model dependency in Stressced mode, and to provide a dedicated Electron desktop UI for that workflow.
 
-The project is intended to track source code and reproducible build configuration only. Generated artifacts such as `target/`, `node_modules/`, `dist*/`, `release/`, `.exe`, `.dll`, `.asar`, `.pak`, and local Cargo caches should stay outside git.
+At a high level:
 
-The original Apache-2.0 license and notices are preserved in `LICENSE` and `NOTICE`.
+- The Rust backend is based on OpenAI Codex and includes a `codexstressced` binary built from `codex-rs/cli`.
+- Stressced mode configures Codex for local/offline inference through a `llama.cpp` OpenAI-compatible API, typically `http://127.0.0.1:8080/v1`.
+- The Electron UI in `codex-rs/ui/codex-stressced-ui` launches or connects to the local app-server flow and communicates with it through RPC/WebSocket plumbing.
+- The UI is packaged with the generated `codexstressced` backend binary during release builds, but generated binaries are not tracked in git.
+- Source code, lockfiles, manifests, scripts, licenses, and build configuration are tracked so the project can be rebuilt from source.
+
+## Relationship To OpenAI Codex
+
+Codex Stressced is a derivative work of OpenAI Codex. It preserves the original Apache-2.0 license and notices in `LICENSE` and `NOTICE`, while adding local/offline behavior and a separate UI focused on llama.cpp usage.
+
+This repository should not be presented as an official OpenAI repository, release, package, or support channel. The upstream Codex README is preserved below for reference because much of the base architecture, CLI, app-server, protocol, and workspace structure still comes from OpenAI Codex.
+
+## Build Notes
+
+The repository is intended to track source code and reproducible build configuration only. Generated artifacts such as `target/`, `node_modules/`, `dist*/`, `release/`, `.exe`, `.dll`, `.asar`, `.pak`, and local Cargo caches should stay outside git.
+
+For local Windows builds, the Codex Stressced UI build script uses a Cargo target cache outside the repository at `D:\codex-stressced-cargo-target` when `D:\` is available. This keeps the repo small while avoiding slow builds on `C:\`.
+
+Useful checks:
+
+```powershell
+cd D:\codex\codex\codex-rs
+just fmt
+just test -p codex-cli
+```
+
+```powershell
+cd D:\codex\codex\codex-rs\ui\codex-stressced-ui
+npm ci
+npm run build
+```
+
+## Upstream Codex README
 
 ---
 
