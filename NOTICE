@@ -1,0 +1,8 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+CodexStressCed includes modifications for local/offline llama.cpp workflows and a dedicated desktop UI.
+
+This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers

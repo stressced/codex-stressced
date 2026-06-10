@@ -1,0 +1,116 @@
+# deps
+# Node.js dependencies
+node_modules
+.pnpm-store
+.pnpm-debug.log
+
+# Keep pnpm-lock.yaml
+!pnpm-lock.yaml
+
+# build
+dist/
+dist-electron/
+bazel-*
+user.bazelrc
+build/
+out/
+storybook-static/
+
+# ignore README for publishing
+codex-cli/README.md
+
+# ignore Nix derivation results
+result
+
+# editor
+.vscode/
+.idea/
+.history/
+.zed/
+*.swp
+*~
+
+# cli tools
+CLAUDE.md
+.claude/
+AGENTS.override.md
+
+# caches
+.cache/
+.turbo/
+.parcel-cache/
+.eslintcache
+.nyc_output/
+.jest/
+*.tsbuildinfo
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env
+.env*
+!.env.example
+.venv/
+
+# package
+*.tgz
+
+# ci
+.vercel/
+.netlify/
+
+# patches
+apply_patch/
+
+# coverage
+coverage/
+
+# personal files
+personal/
+
+# os
+.DS_Store
+Thumbs.db
+Icon?
+.Spotlight-V100/
+
+# Unwanted package managers
+.yarn/
+yarn.lock
+
+# release
+package.json-e
+session.ts-e
+CHANGELOG.ignore.md
+release/
+win-unpacked/
+
+# local CodexStressCed UI build outputs and scratch copies
+originalcodexui/
+codex-rs/ui - Copy/
+codex-rs/ui/**/backup*/
+codex-rs/ui/**/*-backup-*/
+codex-rs/ui/**/src - Copy/
+codex-rs/ui/**/*.asar
+codex-rs/ui/**/*.exe
+codex-rs/ui/**/*.dll
+codex-rs/ui/**/*.pak
+codex-rs/ui/**/*.bin
+codex-rs/ui/**/*.dat
+codex-rs/ui/codex-stressced-ui/dist-backend/
+codex-rs/ui/codex-stressced-ui/main-*.js
+codex-rs/ui/codex-stressced-ui/main.cjs
+codex-rs/ui/codex-stressced-ui/build-*.txt
+codex-rs/ui/codex-stressced-ui/dev-*-log.txt
+codex-rs/ui/frontend/src/*.js
+
+# nix related
+.direnv
+.envrc
+
+# Python bytecode files
+__pycache__/
+*.pyc
