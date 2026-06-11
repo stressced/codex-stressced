@@ -1,6 +1,7 @@
 # deps
 # Node.js dependencies
 node_modules
+**/node_modules/
 .pnpm-store
 .pnpm-debug.log
 
@@ -8,13 +9,34 @@ node_modules
 !pnpm-lock.yaml
 
 # build
+target/
+**/target/
 dist/
+**/dist/
 dist-electron/
+**/dist-electron/
+dist-backend/
+**/dist-backend/
 bazel-*
 user.bazelrc
 build/
 out/
+**/out/
 storybook-static/
+release/
+**/release/
+win-unpacked/
+**/win-unpacked/
+*.asar
+*.exe
+*.dll
+*.pdb
+*.msi
+*.msix
+*.appx
+*.dmg
+*.deb
+*.rpm
 
 # ignore README for publishing
 codex-cli/README.md
@@ -85,8 +107,6 @@ yarn.lock
 package.json-e
 session.ts-e
 CHANGELOG.ignore.md
-release/
-win-unpacked/
 
 # local CodexStressCed UI build outputs and scratch copies
 originalcodexui/
