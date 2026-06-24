@@ -275,9 +275,13 @@ const STRESSCED_ENVIRONMENT_GUIDANCE: &str = r#"CodexStressCed local environment
 - Use native function calls for tools. Never write textual tool markup such as <function=shell_command> or <tool_call> in assistant messages.
 - When the environment says Full Access/danger-full-access/approval never is active, shell commands are not restricted by Codex sandbox or approval policy.
 - Only describe an operation as sandbox-blocked if the tool output explicitly reports a sandbox or permission denial.
+- If an MCP tool returns `Transport closed`, do not retry that same MCP call in a loop; switch to `$env:SAFE_EDIT`/`$env:APPLY_PATCH` or explain the MCP transport failure.
+- In PowerShell, prefer the `workdir` tool argument or `Set-Location ...; ...`; do not mix `cmd /c` with PowerShell cmdlets like `Select-Object`.
+- Use native PowerShell syntax on Windows: replace Unix `head -N` with `Select-Object -First N`, and delimit variables before a colon as `${name}:`.
+- If the same command family fails repeatedly, for example `ninja`, `meson`, `cl.exe`, or `vcvarsall.bat`, stop retrying and explain the blocker or change approach.
 - Missing commands, PATH/compiler problems, Visual Studio environment setup, timeouts, and app errors are environment/toolchain issues; diagnose those directly instead of claiming restricted shell access."#;
 
-const STRESSCED_SHELL_TOOL_GUIDANCE: &str = "CodexStressCed: Full Access is controlled by the UI. Do not use approval or sandbox override arguments, and do not infer restricted shell access from omitted fields.";
+const STRESSCED_SHELL_TOOL_GUIDANCE: &str = "CodexStressCed: Full Access is controlled by the UI. Do not use approval or sandbox override arguments, and do not infer restricted shell access from omitted fields. Prefer the tool workdir argument over nested cmd/powershell directory changes, and stop retrying a command family after repeated failures.";
 static STRESSCED_TEXTUAL_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
 fn adapt_stressced_tools(tools: &mut Vec<serde_json::Value>) {

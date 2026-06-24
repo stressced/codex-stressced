@@ -1,10 +1,22 @@
 // src/App.tsx
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import AssistantMessage, { assistantMessagePreserveWhitespace } from "@assistant-message";
 import { useStore } from "./store";
 
 function getThreadLabel(t: any): string {
   if (t.preview && t.preview.trim().length > 0) return t.preview.trim();
   return t.name || "Chat";
+}
+
+function getLastUserMessageId(messages: Array<{ id: string; role: string }>): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return messages[i].id;
+  }
+  return null;
+}
+
+function isNearScrollBottom(element: HTMLDivElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 48;
 }
 
 /**
@@ -48,21 +60,83 @@ export default function App() {
   const [input, setInput] = useState("");
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [showThinking, setShowThinking] = useState(false);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const lastMainMessage = store.messages[store.messages.length - 1];
-  const lastThinkingMessage = store.thinkingMessages[store.thinkingMessages.length - 1];
+  const autoScrollRef = useRef(true);
+  const previousThreadIdRef = useRef<string | null>(null);
+  const previousViewRef = useRef(showThinking);
+  const previousMainCountRef = useRef(0);
+  const previousThinkingCountRef = useRef(0);
+  const previousLastUserMessageIdRef = useRef<string | null>(null);
+  const mainMessageCount = store.messages.length;
+  const thinkingMessageCount = store.thinkingMessages.length;
+  const lastMainMessage = store.messages[mainMessageCount - 1];
+  const lastThinkingMessage = store.thinkingMessages[thinkingMessageCount - 1];
+  const lastUserMessageId = getLastUserMessageId(store.messages);
   const scrollSignal = showThinking
-    ? `${store.thinkingMessages.length}:${lastThinkingMessage?.content.length ?? 0}:${lastThinkingMessage?.done ? 1 : 0}`
-    : `${store.messages.length}:${lastMainMessage?.id ?? ""}:${store.streaming?.length ?? 0}`;
+    ? `${thinkingMessageCount}:${lastThinkingMessage?.content.length ?? 0}:${lastThinkingMessage?.done ? 1 : 0}`
+    : `${mainMessageCount}:${lastMainMessage?.id ?? ""}:${lastMainMessage?.content.length ?? 0}:${store.isStreaming ? 1 : 0}`;
+
+  const scrollToBottom = () => {
+    const scrollElement = chatScrollRef.current;
+    if (scrollElement) {
+      scrollElement.scrollTop = scrollElement.scrollHeight;
+      return;
+    }
+    messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
+  };
 
   useEffect(() => {
     store.init();
   }, []);
 
-  // Auto-scroll
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
-  }, [scrollSignal, showThinking]);
+  // Force explicit navigation transitions to start at the bottom.
+  useLayoutEffect(() => {
+    const threadChanged = previousThreadIdRef.current !== store.currentThreadId;
+    const viewChanged = previousViewRef.current !== showThinking;
+    const activeMessageCount = showThinking ? thinkingMessageCount : mainMessageCount;
+    const previousActiveMessageCount = showThinking
+      ? previousThinkingCountRef.current
+      : previousMainCountRef.current;
+    const loadedHistory =
+      !!store.currentThreadId &&
+      !store.isStreaming &&
+      activeMessageCount > 0 &&
+      previousActiveMessageCount === 0;
+    const userMessageAdded =
+      !showThinking &&
+      lastUserMessageId !== null &&
+      lastUserMessageId !== previousLastUserMessageIdRef.current;
+
+    if (threadChanged || viewChanged || loadedHistory || userMessageAdded) {
+      autoScrollRef.current = true;
+      scrollToBottom();
+    }
+
+    previousThreadIdRef.current = store.currentThreadId;
+    previousViewRef.current = showThinking;
+    previousMainCountRef.current = mainMessageCount;
+    previousThinkingCountRef.current = thinkingMessageCount;
+    previousLastUserMessageIdRef.current = lastUserMessageId;
+  }, [
+    store.currentThreadId,
+    showThinking,
+    mainMessageCount,
+    thinkingMessageCount,
+    lastUserMessageId,
+    store.isStreaming,
+  ]);
+
+  // Follow streaming output only while the user is already at the bottom.
+  useLayoutEffect(() => {
+    if (!autoScrollRef.current) return;
+    const frame = window.requestAnimationFrame(scrollToBottom);
+    return () => window.cancelAnimationFrame(frame);
+  }, [scrollSignal]);
+
+  const handleChatScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    autoScrollRef.current = isNearScrollBottom(event.currentTarget);
+  };
 
   // Ctrl+V image paste
   useEffect(() => {
@@ -275,7 +349,7 @@ export default function App() {
       }}>
         {store.currentThreadId ? (
           /* ── Chat area ── */
-          <div className="chat-scroll" style={{
+          <div ref={chatScrollRef} className="chat-scroll" onScroll={handleChatScroll} style={{
             flex: "1 1 0%", minHeight: 0, overflowY: "auto",
             display: "flex", flexDirection: "column",
             padding: "20px 24px 12px",
@@ -339,9 +413,10 @@ export default function App() {
                       background: "rgba(255,255,255,0.02)",
                       borderRadius: "0 8px 8px 0",
                       boxSizing: "border-box",
-                      whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word",
+                      whiteSpace: assistantMessagePreserveWhitespace ? "pre-wrap" : undefined,
+                      overflowWrap: "anywhere", wordBreak: "break-word",
                     }}>
-                      {m.content}
+                      <AssistantMessage content={m.content} streaming={isActiveAssistant} />
                     </div>
                   )}
 

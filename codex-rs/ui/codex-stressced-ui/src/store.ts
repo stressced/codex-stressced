@@ -228,6 +228,33 @@ function notificationTurnId(params: Record<string, unknown> | undefined): string
   return stringValue(params?.turnId) || stringValue(params?.turn_id);
 }
 
+function responseTurnId(response: Record<string, unknown> | undefined): string {
+  if (!response) return "";
+  const direct = stringValue(response.turnId) || stringValue(response.turn_id);
+  if (direct) return direct;
+
+  const turn = response.turn;
+  if (turn && typeof turn === "object") {
+    return stringValue((turn as Record<string, unknown>).id);
+  }
+  return "";
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function bestEffortInterruptTurn(threadId: string, turnId: string) {
+  try {
+    await Promise.race([
+      rpc("turn/interrupt", { threadId, turnId }),
+      sleep(1200),
+    ]);
+  } catch (err) {
+    console.error("[store] best-effort turn/interrupt failed:", err);
+  }
+}
+
 function notificationItemId(params: Record<string, unknown> | undefined): string {
   return stringValue(params?.itemId) || stringValue(params?.item_id);
 }
@@ -277,6 +304,11 @@ function upsertCompletedThinkingItem(messages: ThinkingMessage[], item: unknown)
 function environmentErrorKey(output: string): string | null {
   const lower = output.toLowerCase();
   if (lower.includes("windows sandbox: spawn setup refresh")) return "windows sandbox: spawn setup refresh";
+  if (lower.includes("createprocesswithlogonw failed: 1056")) return "windows sandbox createprocesswithlogonw 1056";
+  if (lower.includes("transport closed") && (lower.includes("mcp") || lower.includes("safe_edit"))) return "mcp transport closed";
+  if (lower.includes("parsererror:")) return "powershell parser error";
+  if (lower.includes("is not recognized as an internal or external command")) return "cmd/powershell mixed pipeline";
+  if (lower.includes("tool task failed to receive")) return "tool task join";
   if (lower.includes("failed to initialize nvidia rtc library")) return "hashcat cuda rtc";
   if (lower.includes("cuda sdk toolkit installation not detected")) return "hashcat cuda sdk";
   if (lower.includes("failed to parse tool call arguments as json")) return "tool arguments json";
@@ -575,7 +607,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   sendMessage: async (text, image) => {
     console.log("[store] sendMessage called with text:", text);
-    const { currentThreadId, messages, connectionStatus, fullAccess } = get();
+    const { currentThreadId, connectionStatus, fullAccess, isStreaming } = get();
     console.log("[store] sendMessage state:", { currentThreadId, connectionStatus });
     if (!currentThreadId) {
       console.log("[store] sendMessage: no currentThreadId, returning");
@@ -591,11 +623,18 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
+    const activeTurnId = toolProgress.turnId;
+    if (isStreaming && activeTurnId) {
+      await bestEffortInterruptTurn(currentThreadId, activeTurnId);
+      resetToolProgress();
+    }
+
     const textImagePaths = extractLocalImagePaths(text);
     if (textImagePaths.length > 0) {
       console.log("[store] sendMessage detected local image paths:", textImagePaths);
     }
 
+    const { messages } = get();
     const userMsg: Message = {
       id: nextId(),
       role: "user",
@@ -662,6 +701,10 @@ export const useStore = create<AppState>((set, get) => ({
         ...accessPolicyParams(fullAccess),
         input: inputParts,
       });
+      const startedTurnId = responseTurnId(turnRes);
+      if (startedTurnId) {
+        toolProgress.turnId = startedTurnId;
+      }
       console.log("[store] RPC turn/start response", turnRes);
     } catch (err) {
       console.error("[store] turn/start failed:", err);
@@ -772,7 +815,7 @@ export const useStore = create<AppState>((set, get) => ({
       toolProgress.visibleAssistant = true;
       set((s) => {
         const next = (s.streaming ?? "") + text;
-        const msgs = s.messages.map((m) => m);
+        const msgs = s.messages.slice();
 
         const last = msgs[msgs.length - 1];
         if (last && last.role === "assistant" && s.isStreaming) {
@@ -859,6 +902,9 @@ export const useStore = create<AppState>((set, get) => ({
         }
         return;
       }
+
+      toolProgress.repeatedErrorKey = null;
+      toolProgress.repeatedErrorCount = 0;
       return;
     }
 

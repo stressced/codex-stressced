@@ -193,7 +193,7 @@ impl ToolCallRuntime {
             return Ok(());
         };
 
-        let fingerprint = ToolCallFingerprint::from_call(call);
+        let fingerprint = ToolCallFingerprint::from_call(call, /*stressced_mode*/ true);
         let mut counts = repeated_tool_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -202,7 +202,7 @@ impl ToolCallRuntime {
 
         if *count > STRESSCED_REPEATED_TOOL_CALL_LIMIT {
             return Err(FunctionCallError::RespondToModel(format!(
-                "Repeated identical `{}` tool call blocked after {} executions in this turn. \
+                "Repeated identical or similar `{}` tool call blocked after {} executions in this turn. \
                  Do not retry the same tool call. Explain the blocker to the user or change approach.",
                 call.tool_name, STRESSCED_REPEATED_TOOL_CALL_LIMIT
             )));
@@ -274,9 +274,14 @@ struct ToolCallFingerprint {
 }
 
 impl ToolCallFingerprint {
-    fn from_call(call: &ToolCall) -> Self {
+    fn from_call(call: &ToolCall, stressced_mode: bool) -> Self {
         let payload = match &call.payload {
-            ToolPayload::Function { arguments } => format!("function:{arguments}"),
+            ToolPayload::Function { arguments } => stressced_function_fingerprint(
+                call,
+                arguments,
+                /*stressced_mode*/ stressced_mode,
+            )
+            .unwrap_or_else(|| format!("function:{arguments}")),
             ToolPayload::ToolSearch { arguments } => format!("tool_search:{}", arguments.query),
             ToolPayload::Custom { input } => format!("custom:{input}"),
         };
@@ -286,6 +291,83 @@ impl ToolCallFingerprint {
             payload,
         }
     }
+}
+
+fn stressced_function_fingerprint(
+    call: &ToolCall,
+    arguments: &str,
+    stressced_mode: bool,
+) -> Option<String> {
+    if !stressced_mode {
+        return None;
+    }
+
+    let is_shell_tool = call.tool_name.namespace.is_none()
+        && matches!(
+            call.tool_name.name.as_str(),
+            "shell_command" | "exec_command" | "unified_exec"
+        );
+    if !is_shell_tool {
+        return stressced_mcp_fingerprint(call, arguments);
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let command = value.get("command").and_then(serde_json::Value::as_str)?;
+    let workdir = value
+        .get("workdir")
+        .or_else(|| value.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let normalized = normalize_stressced_shell_command(command);
+    let family = stressced_shell_command_family(&normalized).unwrap_or(normalized.as_str());
+    Some(format!(
+        "stressced_shell:{}:{}",
+        normalize_stressced_pathish(workdir),
+        family
+    ))
+}
+
+fn stressced_mcp_fingerprint(call: &ToolCall, arguments: &str) -> Option<String> {
+    let flat_name = codex_tools::code_mode_name_for_tool_name(&call.tool_name);
+    let safe_edit = flat_name.starts_with("mcp__safe_edit__")
+        || call.tool_name.namespace.as_deref() == Some("mcp__safe_edit");
+    safe_edit.then(|| format!("stressced_mcp_safe_edit:{flat_name}:{arguments}"))
+}
+
+fn normalize_stressced_shell_command(command: &str) -> String {
+    command
+        .replace("\r\n", "\n")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn normalize_stressced_pathish(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn stressced_shell_command_family(command: &str) -> Option<&'static str> {
+    if command.contains("ninja ") || command.contains("ninja.exe") {
+        return Some("build:ninja");
+    }
+    if command.contains("meson setup") {
+        return Some("build:meson-setup");
+    }
+    if command.contains("cl.exe") {
+        return Some("toolchain:cl");
+    }
+    if command.contains("vcvarsall.bat") {
+        return Some("toolchain:vcvarsall");
+    }
+    if command.contains("windows kits") && command.contains("get-childitem") {
+        return Some("toolchain:windows-kits-list");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -552,7 +634,97 @@ mod tests {
             panic!("expected text output");
         };
         assert!(
-            text.contains("Repeated identical `test_tool` tool call blocked"),
+            text.contains("Repeated identical or similar `test_tool` tool call blocked"),
+            "{text}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stressced_repeated_tool_call_guard_blocks_similar_shell_families() -> anyhow::Result<()>
+    {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let tool_name = codex_tools::ToolName::plain("shell_command");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingHandler {
+            tool_name: tool_name.clone(),
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn CoreToolRuntime>;
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let mut runtime = ToolCallRuntime::new(router, session, turn_context, tracker);
+        runtime.repeated_tool_calls = Some(Arc::new(Mutex::new(HashMap::new())));
+        let cancellation_token = CancellationToken::new();
+        let commands = [
+            r#"{"command":"ninja -C D:\\timeres\\build"}"#,
+            r#"{"command":"& \"D:\\timeres\\build\\ninja.exe\" -v"}"#,
+            r#"{"command":"cmd /c ninja -C D:\\timeres\\build"}"#,
+            r#"{"command":"ninja -C D:\\timeres\\build --verbose"}"#,
+        ];
+
+        for (index, command) in commands
+            .iter()
+            .take(STRESSCED_REPEATED_TOOL_CALL_LIMIT)
+            .enumerate()
+        {
+            let response = runtime
+                .clone()
+                .handle_tool_call(
+                    ToolCall {
+                        tool_name: tool_name.clone(),
+                        call_id: format!("call-{index}"),
+                        payload: ToolPayload::Function {
+                            arguments: command.to_string(),
+                        },
+                    },
+                    cancellation_token.clone(),
+                )
+                .await?;
+            assert_eq!(
+                ResponseInputItem::FunctionCallOutput {
+                    call_id: format!("call-{index}"),
+                    output: FunctionCallOutputPayload {
+                        body: FunctionCallOutputBody::Text("ok".to_string()),
+                        success: Some(true),
+                    },
+                },
+                response
+            );
+        }
+
+        let response = runtime
+            .handle_tool_call(
+                ToolCall {
+                    tool_name: tool_name.clone(),
+                    call_id: "call-4".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: commands[STRESSCED_REPEATED_TOOL_CALL_LIMIT].to_string(),
+                    },
+                },
+                cancellation_token,
+            )
+            .await?;
+
+        let ResponseInputItem::FunctionCallOutput { call_id, output } = response else {
+            panic!("expected function call output");
+        };
+        assert_eq!("call-4", call_id);
+        assert_eq!(Some(false), output.success);
+        assert_eq!(
+            STRESSCED_REPEATED_TOOL_CALL_LIMIT,
+            calls.load(Ordering::Relaxed)
+        );
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            panic!("expected text output");
+        };
+        assert!(
+            text.contains("Repeated identical or similar `shell_command` tool call blocked"),
             "{text}"
         );
 

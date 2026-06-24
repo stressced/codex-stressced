@@ -5,11 +5,17 @@ import path from "path";
 
 export default defineConfig(({ command, mode }) => {
   const isBuild = command === "build";
+  const uiVariant = process.env.CODEX_STRESSCED_UI_VARIANT === "lite" ? "lite" : "full";
 
   return {
     plugins: [react()],
     root: __dirname,
     base: "./",
+    resolve: {
+      alias: {
+        "@assistant-message": path.resolve(__dirname, `src/assistant-message/${uiVariant}.tsx`),
+      },
+    },
     build: {
       outDir: "dist",
       rollupOptions: {

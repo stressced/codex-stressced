@@ -10,6 +10,8 @@
     "dev": "concurrently \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5174 && electron .\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build:backend": "node build-backend.mjs",
+    "build:lite": "node build-variant.mjs lite",
+    "build:full": "node build-variant.mjs full",
     "build": "npm run typecheck && npm run build:backend && vite build && node build-electron.mjs && electron-builder",
     "build:frontend": "vite build",
     "build:electron": "node build-electron.mjs",
