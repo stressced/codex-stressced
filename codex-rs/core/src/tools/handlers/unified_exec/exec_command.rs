@@ -248,6 +248,13 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
             }));
         }
 
+        if std::env::var("CODEX_STRESSCED_MODE").is_ok()
+            && let Some(reason) = StresscedEditGuard::block_reason(&hook_command, &cwd)
+        {
+            manager.release_process_id(process_id).await;
+            return Err(FunctionCallError::RespondToModel(reason));
+        }
+
         let stressced_edit_guard = std::env::var("CODEX_STRESSCED_MODE").is_ok().then(|| {
             StresscedEditGuard::capture(
                 &hook_command,

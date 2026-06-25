@@ -30,6 +30,65 @@ The repository is intended to track source code and reproducible build configura
 
 For local Windows builds, the Codex Stressced UI build script uses a Cargo target cache outside the repository at `D:\codex-stressced-cargo-target` when `D:\` is available. This keeps the repo small while avoiding slow builds on `C:\`.
 
+### Codex Stressced UI Builds
+
+The Stressced desktop UI lives in `codex-rs/ui/codex-stressced-ui`.
+
+Install frontend dependencies before building:
+
+```powershell
+cd D:\codex\codex\codex-rs\ui\codex-stressced-ui
+npm ci
+```
+
+Build the default package:
+
+```powershell
+npm run build
+```
+
+Build the lightweight package:
+
+```powershell
+.\build-codexstressced-lite.ps1
+```
+
+Build the full Markdown package:
+
+```powershell
+.\build-codexstressced-full.ps1
+```
+
+Both variant scripts call `build-variant.mjs`, build the Rust backend through `build-backend.mjs`, build the Vite frontend, build the Electron main process, and package with `electron-builder`.
+
+The generated packages are written to:
+
+- `release-lite/` for Lite
+- `release-full/` for Full
+
+These directories are generated artifacts and should not be committed.
+
+### Lite vs Full UI
+
+Lite and Full share the same backend, app-server connection, chat state, Full Access behavior, Thinking swap, local image handling, scroll behavior, and error detection. The difference is only the assistant-message renderer selected at build time through `CODEX_STRESSCED_UI_VARIANT`.
+
+- Lite uses `src/assistant-message/lite.tsx`. It renders assistant text directly with preserved whitespace and minimal React work. This is the fastest mode and is recommended for long local-model summaries, high token streaming, and day-to-day llama.cpp usage.
+- Full uses `src/assistant-message/full.tsx` and `src/assistant-message/full.css`. It renders Markdown through `react-markdown` with `remark-gfm`, so bold text, headings, lists, code blocks, blockquotes, and tables display more cleanly. It throttles streaming Markdown updates to reduce render cost, but it is still heavier than Lite.
+
+Use Lite when performance is the priority. Use Full when readable Markdown summaries and tables are more important than maximum streaming smoothness.
+
+### Current Stressced Workflow Additions
+
+The current Stressced changes include:
+
+- Additional local-agent guidance for Windows shell behavior, PowerShell syntax, MCP transport failures, and avoiding repeated toolchain loops.
+- A repeated-tool-call guard that blocks identical or similar repeated tool calls in one turn, including common repeated build/toolchain families such as `ninja`, `meson setup`, `cl.exe`, `vcvarsall.bat`, and Windows Kits directory listing loops.
+- A Stressced shell rewrite safety block for existing source-like files. Broad rewrites through `Set-Content`, `Out-File`, redirection, heredocs, or inline Python are refused in Stressced mode; the agent should use Safe Edit or `$env:APPLY_PATCH` for targeted edits instead. Creating brand-new files remains allowed.
+- UI-side environment error detection for repeated Windows sandbox, MCP transport, PowerShell parser, mixed shell, tool-task, Hashcat/CUDA, and malformed tool-argument failures.
+- Best-effort interruption of an active turn before sending a new message, so a stuck local turn is less likely to block the next prompt.
+- Chat auto-scroll behavior that follows output while the user is at the bottom, stops following when the user scrolls up manually, and starts loaded chats at the latest message.
+- Lite/Full assistant-message renderer variants and build scripts for both packages.
+
 Useful checks:
 
 ```powershell

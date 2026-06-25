@@ -148,6 +148,13 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         return Ok(output);
     }
 
+    if std::env::var("CODEX_STRESSCED_MODE").is_ok()
+        && let Some(reason) =
+            StresscedEditGuard::block_reason(&hook_command, exec_params.cwd.as_path())
+    {
+        return Err(FunctionCallError::RespondToModel(reason));
+    }
+
     let stressced_edit_guard = std::env::var("CODEX_STRESSCED_MODE").is_ok().then(|| {
         StresscedEditGuard::capture(
             &hook_command,

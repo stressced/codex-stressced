@@ -10,6 +10,8 @@ const MAX_SNAPSHOT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_TARGETS_PER_COMMAND: usize = 8;
 const LARGE_CHANGE_RATIO: f64 = 0.35;
 const LARGE_CHANGE_MIN_BYTES: usize = 512;
+const LARGE_INLINE_REWRITE_COMMAND_BYTES: usize = 4096;
+const EMBEDDED_SCRIPT_REWRITE_COMMAND_BYTES: usize = 1000;
 
 pub(crate) struct StresscedEditGuard {
     command_indicators: Vec<&'static str>,
@@ -35,6 +37,44 @@ struct FileChangeNotice {
 }
 
 impl StresscedEditGuard {
+    pub(crate) fn block_reason(command: &str, cwd: &Path) -> Option<String> {
+        let indicators = command_indicators(command);
+        if indicators.is_empty() {
+            return None;
+        }
+
+        let mut targets = existing_source_targets(command, cwd);
+        let redirection_targets = shell_redirection_source_targets(command, cwd);
+        for target in redirection_targets.iter() {
+            if !targets.contains(target) {
+                targets.push(target.clone());
+            }
+        }
+        if targets.is_empty() {
+            return None;
+        }
+
+        let direct_rewrite = indicators
+            .iter()
+            .any(|indicator| matches!(*indicator, "Set-Content" | "Out-File" | "Add-Content"))
+            || !redirection_targets.is_empty();
+        let embedded_script = indicators.iter().any(|indicator| {
+            matches!(
+                *indicator,
+                "PowerShell here-string" | "shell heredoc" | "python inline script"
+            )
+        });
+        let large_inline_rewrite = command.len() >= LARGE_INLINE_REWRITE_COMMAND_BYTES;
+        let embedded_rewrite =
+            embedded_script && command.len() >= EMBEDDED_SCRIPT_REWRITE_COMMAND_BYTES;
+
+        if direct_rewrite || large_inline_rewrite || embedded_rewrite {
+            return Some(format_block_notice(&indicators, &targets));
+        }
+
+        None
+    }
+
     pub(crate) fn capture(command: &str, cwd: &Path, codex_home: &Path, call_id: &str) -> Self {
         let command_indicators = command_indicators(command);
         if command_indicators.is_empty() {
@@ -129,11 +169,20 @@ fn command_indicators(command: &str) -> Vec<&'static str> {
     if lower.contains("out-file") {
         indicators.push("Out-File");
     }
+    if lower.contains("add-content") {
+        indicators.push("Add-Content");
+    }
     if lower.contains(" -replace ") || lower.contains("`n-replace ") {
         indicators.push("regex replace");
     }
     if command.contains("@\"") || command.contains("@'") {
         indicators.push("PowerShell here-string");
+    }
+    if command.contains("<<") {
+        indicators.push("shell heredoc");
+    }
+    if lower.contains("python -c") || lower.contains("python3 -c") || lower.contains("py -c") {
+        indicators.push("python inline script");
     }
     if command.contains('>') {
         indicators.push("shell redirection");
@@ -141,6 +190,77 @@ fn command_indicators(command: &str) -> Vec<&'static str> {
     indicators.sort_unstable();
     indicators.dedup();
     indicators
+}
+
+fn existing_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    extract_source_paths(command, cwd)
+        .into_iter()
+        .filter(|path| matches!(fs::metadata(path), Ok(metadata) if metadata.is_file()))
+        .take(MAX_TARGETS_PER_COMMAND)
+        .collect()
+}
+
+fn shell_redirection_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut targets = BTreeSet::new();
+    let chars = command.char_indices().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        let (byte_index, ch) = chars[index];
+        if ch != '>' {
+            index += 1;
+            continue;
+        }
+
+        let previous = command[..byte_index].chars().next_back();
+        if previous == Some('=') {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 1;
+        while cursor < chars.len() && chars[cursor].1 == '>' {
+            cursor += 1;
+        }
+        if cursor < chars.len() && chars[cursor].1 == '=' {
+            index = cursor + 1;
+            continue;
+        }
+        while cursor < chars.len() && chars[cursor].1.is_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= chars.len() {
+            break;
+        }
+
+        let quote = matches!(chars[cursor].1, '"' | '\'').then_some(chars[cursor].1);
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let start = cursor;
+        if start >= chars.len() {
+            break;
+        }
+        while cursor < chars.len() {
+            let current = chars[cursor].1;
+            if quote.is_some_and(|quote| current == quote)
+                || (quote.is_none()
+                    && (current.is_whitespace() || matches!(current, '|' | '<' | '>')))
+            {
+                break;
+            }
+            cursor += 1;
+        }
+
+        let end = chars.get(cursor).map_or(command.len(), |(index, _)| *index);
+        if let Some(path) = candidate_path(command.get(chars[start].0..end), cwd)
+            && matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file())
+        {
+            targets.insert(normalize_existing_path(path));
+        }
+        index = cursor + 1;
+    }
+
+    targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
 }
 
 fn extract_source_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
@@ -343,6 +463,35 @@ fn format_notice(indicators: &[&str], notices: &[FileChangeNotice]) -> String {
     lines.join("\n")
 }
 
+fn format_block_notice(indicators: &[&str], targets: &[PathBuf]) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        "CodexStressCed file safety block: refused a broad shell rewrite of existing source-like file(s)."
+            .to_string(),
+    );
+    lines.push(format!(
+        "- Detected risky shell edit pattern(s): {}.",
+        indicators.join(", ")
+    ));
+    lines.push(
+        "- Do not rewrite existing source files through `Set-Content`, `Out-File`, shell redirection, heredocs, or inline Python."
+            .to_string(),
+    );
+    lines.push(
+        "- Use `safe_edit_replace_exact`, `safe_edit_insert_before`, `safe_edit_insert_after`, or `$env:APPLY_PATCH` with a targeted patch instead."
+            .to_string(),
+    );
+    lines.push(
+        "- Large `safe_edit_create_file` remains acceptable for brand-new files; inspect existing files and edit only the required block."
+            .to_string(),
+    );
+    lines.push("- Existing target(s):".to_string());
+    for target in targets {
+        lines.push(format!("  - {}", target.display()));
+    }
+    lines.join("\n")
+}
+
 fn sanitize_path_fragment(value: &str) -> String {
     let mut sanitized = value
         .chars()
@@ -418,5 +567,69 @@ new content
             .expect("read backups")
             .count();
         assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn blocks_shell_rewrite_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("timeres.c");
+        fs::write(&source, "int main(void) { return 0; }\n").expect("write source");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"@"
+int main(void) { return 1; }
+"@ | Set-Content -LiteralPath "timeres.c" -Encoding utf8"#,
+            cwd,
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("CodexStressCed file safety block"));
+        assert!(reason.contains("Set-Content"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn allows_shell_write_to_new_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Set-Content -LiteralPath "new_file.c" -Value "int main(void) { return 0; }""#,
+            cwd,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_inline_python_rewrite_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("local_control_runtime_smoke_harness_test.cpp");
+        fs::write(&source, "int main(void) { return 0; }\n").expect("write source");
+        let payload = "int value = 1;\\n".repeat(120);
+        let command = format!(
+            "python -c \"open('local_control_runtime_smoke_harness_test.cpp','w').write('{payload}')\""
+        );
+
+        let reason = StresscedEditGuard::block_reason(&command, cwd).expect("block reason");
+
+        assert!(reason.contains("python inline script"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn allows_read_command_with_greater_than_pattern() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("timeres.c"), "if (value > 0) { return 1; }\n").expect("write source");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Select-String -Pattern "value > 0" "timeres.c""#,
+            cwd,
+        );
+
+        assert_eq!(reason, None);
     }
 }
