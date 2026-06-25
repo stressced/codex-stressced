@@ -43,21 +43,22 @@ impl StresscedEditGuard {
             return None;
         }
 
-        let mut targets = existing_source_targets(command, cwd);
-        let redirection_targets = shell_redirection_source_targets(command, cwd);
-        for target in redirection_targets.iter() {
-            if !targets.contains(target) {
-                targets.push(target.clone());
-            }
-        }
+        let targets = existing_source_write_targets(command, cwd);
         if targets.is_empty() {
             return None;
         }
 
-        let direct_rewrite = indicators
-            .iter()
-            .any(|indicator| matches!(*indicator, "Set-Content" | "Out-File" | "Add-Content"))
-            || !redirection_targets.is_empty();
+        let direct_rewrite = indicators.iter().any(|indicator| {
+            matches!(
+                *indicator,
+                "Set-Content"
+                    | "Out-File"
+                    | "Add-Content"
+                    | "shell redirection"
+                    | "python inline script"
+                    | "WriteAllText"
+            )
+        });
         let embedded_script = indicators.iter().any(|indicator| {
             matches!(
                 *indicator,
@@ -184,6 +185,9 @@ fn command_indicators(command: &str) -> Vec<&'static str> {
     if lower.contains("python -c") || lower.contains("python3 -c") || lower.contains("py -c") {
         indicators.push("python inline script");
     }
+    if lower.contains("writealltext") {
+        indicators.push("WriteAllText");
+    }
     if command.contains('>') {
         indicators.push("shell redirection");
     }
@@ -192,12 +196,83 @@ fn command_indicators(command: &str) -> Vec<&'static str> {
     indicators
 }
 
-fn existing_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
-    extract_source_paths(command, cwd)
+fn existing_source_write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut targets = BTreeSet::new();
+    for path in powershell_write_source_targets(command, cwd)
         .into_iter()
-        .filter(|path| matches!(fs::metadata(path), Ok(metadata) if metadata.is_file()))
-        .take(MAX_TARGETS_PER_COMMAND)
-        .collect()
+        .chain(shell_redirection_source_targets(command, cwd))
+        .chain(script_write_source_targets(command, cwd))
+    {
+        if matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file()) {
+            targets.insert(normalize_existing_path(path));
+        }
+    }
+    targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn powershell_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut targets = BTreeSet::new();
+    for segment in command.split('|') {
+        let tokens = shell_like_tokens(segment);
+        for (index, token) in tokens.iter().enumerate() {
+            let lower = token.to_ascii_lowercase();
+            let path_flags: &[&str] = match lower.as_str() {
+                "set-content" | "add-content" => &["-literalpath", "-path"],
+                "out-file" => &["-literalpath", "-filepath", "-path"],
+                _ => continue,
+            };
+
+            let mut found_flag_target = false;
+            for pair in tokens[index + 1..].windows(2) {
+                if path_flags.contains(&pair[0].to_ascii_lowercase().as_str()) {
+                    if let Some(path) = candidate_path(Some(&pair[1]), cwd) {
+                        targets.insert(normalize_existing_path(path));
+                        found_flag_target = true;
+                    }
+                }
+            }
+
+            if !found_flag_target {
+                for candidate in &tokens[index + 1..] {
+                    if candidate.starts_with('-') {
+                        continue;
+                    }
+                    if let Some(path) = candidate_path(Some(candidate), cwd) {
+                        targets.insert(normalize_existing_path(path));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn shell_like_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in value.chars() {
+        if quote.is_some_and(|quote| ch == quote) {
+            quote = None;
+            continue;
+        }
+        if quote.is_none() && matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if quote.is_none() && ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn shell_redirection_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
@@ -260,6 +335,25 @@ fn shell_redirection_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
         index = cursor + 1;
     }
 
+    targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn script_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut targets = BTreeSet::new();
+    if let Ok(open_write) = Regex::new(r#"open\(\s*['"]([^'"\r\n]+)['"]\s*,\s*['"][^'"]*[wa]"#) {
+        for captures in open_write.captures_iter(command) {
+            if let Some(path) = candidate_path(captures.get(1).map(|match_| match_.as_str()), cwd) {
+                targets.insert(normalize_existing_path(path));
+            }
+        }
+    }
+    if let Ok(write_all_text) = Regex::new(r#"WriteAllText\(\s*['"]([^'"\r\n]+)['"]"#) {
+        for captures in write_all_text.captures_iter(command) {
+            if let Some(path) = candidate_path(captures.get(1).map(|match_| match_.as_str()), cwd) {
+                targets.insert(normalize_existing_path(path));
+            }
+        }
+    }
     targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
 }
 
@@ -598,6 +692,28 @@ int main(void) { return 1; }
             r#"Set-Content -LiteralPath "new_file.c" -Value "int main(void) { return 0; }""#,
             cwd,
         );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_new_doc_with_existing_source_path_in_content() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("docs")).expect("create docs");
+        fs::create_dir_all(cwd.join("tests")).expect("create tests");
+        fs::write(
+            cwd.join("tests")
+                .join("local_control_runtime_smoke_harness_test.cpp"),
+            "int main(void) { return 0; }\n",
+        )
+        .expect("write source");
+
+        let command = r#"@'
+The existing local baseline is `tests\local_control_runtime_smoke_harness_test.cpp`.
+'@ | Set-Content -LiteralPath 'docs\CONTROL_TRANSPORT_DESIGN.md' -Encoding utf8"#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
 
         assert_eq!(reason, None);
     }
