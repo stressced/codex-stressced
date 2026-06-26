@@ -38,7 +38,18 @@ struct FileChangeNotice {
 
 impl StresscedEditGuard {
     pub(crate) fn block_reason(command: &str, cwd: &Path) -> Option<String> {
-        let indicators = command_indicators(command);
+        if let Some(reason) = command_usage_block_reason(command) {
+            return Some(reason);
+        }
+
+        let mut indicators = command_indicators(command);
+        let python_direct_source_write = command_invokes_python(command)
+            && !script_write_source_targets(command, cwd).is_empty();
+        if python_direct_source_write {
+            indicators.push("Python direct source write");
+            indicators.sort_unstable();
+            indicators.dedup();
+        }
         if indicators.is_empty() {
             return None;
         }
@@ -56,6 +67,7 @@ impl StresscedEditGuard {
                     | "Add-Content"
                     | "shell redirection"
                     | "python inline script"
+                    | "Python direct source write"
                     | "WriteAllText"
             )
         });
@@ -161,6 +173,148 @@ impl StresscedEditGuard {
     }
 }
 
+fn command_usage_block_reason(command: &str) -> Option<String> {
+    if command.contains("@'") || command.contains("@\"") || command.contains("<<") {
+        return None;
+    }
+
+    let tokens = command_usage_tokens(&command.to_ascii_lowercase());
+    let mut issues = Vec::new();
+
+    if tokens_contain_command(&tokens, |token| token == "head") {
+        issues.push(
+            "- Unix `head` is not available in this PowerShell workspace. Use `... | Select-Object -First N` instead.",
+        );
+    }
+
+    if rg_tokens_contain(&tokens, |token| matches!(token, "-rn" | "-nr")) {
+        issues.push(
+            "- For ripgrep line numbers, use `rg -n \"pattern\" path`. Do not use `rg -rn`; `-r` is ripgrep replacement mode.",
+        );
+    }
+
+    if rg_tokens_contain(&tokens, |token| {
+        token == "--include" || token.starts_with("--include=")
+    }) {
+        issues.push(
+            "- This ripgrep build does not accept `--include`. Use `-g \"glob\"` or search a narrower path instead.",
+        );
+    }
+
+    if issues.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(
+        "CodexStressCed shell preflight block: command was not run because it uses a tool pattern that repeatedly fails in this Windows PowerShell workspace."
+            .to_string(),
+    );
+    lines.extend(issues.into_iter().map(str::to_string));
+    lines.push(
+        "- Correct the command once and retry; do not switch to broad file rewrites or alternate quoting styles."
+            .to_string(),
+    );
+    Some(lines.join("\n"))
+}
+
+fn command_usage_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if quote.is_some_and(|quote| ch == quote) {
+            quote = None;
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if matches!(ch, '|' | ';' | '&') {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            let mut op = ch.to_string();
+            if matches!(ch, '|' | '&') && chars.peek().is_some_and(|next| *next == ch) {
+                op.push(ch);
+                chars.next();
+            }
+            tokens.push(op);
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn tokens_contain_command(tokens: &[String], predicate: impl Fn(&str) -> bool) -> bool {
+    let mut expects_command = true;
+    for token in tokens {
+        if is_command_separator(token) {
+            expects_command = true;
+            continue;
+        }
+        if expects_command && token == "&" {
+            continue;
+        }
+        if expects_command && predicate(token) {
+            return true;
+        }
+        expects_command = false;
+    }
+    false
+}
+
+fn rg_tokens_contain(tokens: &[String], predicate: impl Fn(&str) -> bool) -> bool {
+    let mut expects_command = true;
+    for (index, token) in tokens.iter().enumerate() {
+        if is_command_separator(token) {
+            expects_command = true;
+            continue;
+        }
+        if expects_command && token == "&" {
+            continue;
+        }
+        if !expects_command || !matches!(token.as_str(), "rg" | "rg.exe") {
+            expects_command = false;
+            continue;
+        }
+
+        for token in &tokens[index + 1..] {
+            if is_command_separator(token) {
+                break;
+            }
+            if predicate(token) {
+                return true;
+            }
+        }
+
+        expects_command = false;
+    }
+    false
+}
+
+fn is_command_separator(token: &str) -> bool {
+    matches!(token, "|" | ";" | "&&" | "||")
+}
+
 fn command_indicators(command: &str) -> Vec<&'static str> {
     let lower = command.to_ascii_lowercase();
     let mut indicators = Vec::new();
@@ -198,16 +352,33 @@ fn command_indicators(command: &str) -> Vec<&'static str> {
 
 fn existing_source_write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut targets = BTreeSet::new();
+    let use_script_targets =
+        command_invokes_python(command) || command.to_ascii_lowercase().contains("writealltext");
     for path in powershell_write_source_targets(command, cwd)
         .into_iter()
         .chain(shell_redirection_source_targets(command, cwd))
-        .chain(script_write_source_targets(command, cwd))
+        .chain(
+            use_script_targets
+                .then(|| script_write_source_targets(command, cwd))
+                .unwrap_or_default(),
+        )
     {
         if matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file()) {
             targets.insert(normalize_existing_path(path));
         }
     }
     targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn command_invokes_python(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let tokens = shell_like_tokens(&lower);
+    tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "python" | "python3" | "py"))
+        || lower.contains("| python")
+        || lower.contains("| python3")
+        || lower.contains("| py")
 }
 
 fn powershell_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
@@ -340,8 +511,19 @@ fn shell_redirection_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
 
 fn script_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut targets = BTreeSet::new();
-    if let Ok(open_write) = Regex::new(r#"open\(\s*['"]([^'"\r\n]+)['"]\s*,\s*['"][^'"]*[wa]"#) {
+    if let Ok(open_write) = Regex::new(
+        r#"open\(\s*[rRuUbBfF]*['"]([^'"\r\n]+)['"]\s*,\s*[rRuUbBfF]*['"][^'"\r\n]*[wa][^'"\r\n]*['"]"#,
+    ) {
         for captures in open_write.captures_iter(command) {
+            if let Some(path) = candidate_path(captures.get(1).map(|match_| match_.as_str()), cwd) {
+                targets.insert(normalize_existing_path(path));
+            }
+        }
+    }
+    if let Ok(pathlib_write) = Regex::new(
+        r#"(?:Path|pathlib\.Path)\(\s*[rRuUbBfF]*['"]([^'"\r\n]+)['"]\s*\)\.write_(?:text|bytes)\s*\("#,
+    ) {
+        for captures in pathlib_write.captures_iter(command) {
             if let Some(path) = candidate_path(captures.get(1).map(|match_| match_.as_str()), cwd) {
                 targets.insert(normalize_existing_path(path));
             }
@@ -568,11 +750,11 @@ fn format_block_notice(indicators: &[&str], targets: &[PathBuf]) -> String {
         indicators.join(", ")
     ));
     lines.push(
-        "- Do not rewrite existing source files through `Set-Content`, `Out-File`, shell redirection, heredocs, or inline Python."
+        "- Python is allowed for reading, analysis, calculations, and generating snippets; do not use it as a direct writer for existing source files."
             .to_string(),
     );
     lines.push(
-        "- Use `safe_edit_replace_exact`, `safe_edit_insert_before`, `safe_edit_insert_after`, or `$env:APPLY_PATCH` with a targeted patch instead."
+        "- For existing source edits, use `safe_edit_replace_exact`, `safe_edit_insert_before`, `safe_edit_insert_after`, or `$env:APPLY_PATCH` with a targeted patch."
             .to_string(),
     );
     lines.push(
@@ -664,6 +846,143 @@ new content
     }
 
     #[test]
+    fn blocks_unix_head_with_powershell_hint() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg "LoopbackControlRuntime" tests -n | head -20"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("shell preflight block"));
+        assert!(reason.contains("Select-Object -First N"));
+    }
+
+    #[test]
+    fn blocks_unix_head_without_pipe_spacing() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg "LoopbackControlRuntime" tests -n|head -20"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Select-Object -First N"));
+    }
+
+    #[test]
+    fn blocks_rg_rn_with_line_number_hint() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg "ControlCommandAuthorizationPolicy::authorize" src/ -rn | Select-Object -First 5"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("rg -n"));
+        assert!(reason.contains("replacement mode"));
+    }
+
+    #[test]
+    fn blocks_rg_include_with_glob_hint() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg "QueryState" --include "*.cpp" tests"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("does not accept `--include`"));
+        assert!(reason.contains("-g \"glob\""));
+    }
+
+    #[test]
+    fn blocks_rg_include_equals_with_glob_hint() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg "QueryState" --include="*.cpp" tests"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("does not accept `--include`"));
+        assert!(reason.contains("-g \"glob\""));
+    }
+
+    #[test]
+    fn allows_power_shell_first_limit_and_rg_line_numbers() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg -n "LoopbackControlRuntime" tests | Select-Object -First 20"#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_rg_search_for_head_literal() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(r#"rg "head" src tests"#, temp.path());
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_write_output_exact_head_literal() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(r#"Write-Output "head""#, temp.path());
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_quoted_rg_rn_instruction_that_is_not_a_command() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "Do not run rg pattern path -rn""#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_quoted_head_text_that_is_not_a_command() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "Use rg -n pattern path | head -20 only in Bash docs""#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_here_string_text_that_mentions_head() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"@'
+Use `rg -n pattern path | head -20` only in Bash docs.
+'@ | Set-Content -LiteralPath 'notes.md' -Encoding utf8"#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
     fn blocks_shell_rewrite_of_existing_source_file() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
@@ -733,6 +1052,83 @@ The existing local baseline is `tests\local_control_runtime_smoke_harness_test.c
 
         assert!(reason.contains("python inline script"));
         assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_here_string_python_raw_path_rewrite_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("memory_store.cpp");
+        fs::write(&source, "int old_value = 0;\n").expect("write source");
+        let command = r#"@'
+from pathlib import Path
+path = r"memory_store.cpp"
+with open(r"memory_store.cpp", "w", encoding="utf-8") as handle:
+    handle.write("int new_value = 1;\n")
+'@ | python"#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("Python direct source write"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_pathlib_write_text_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("memory_store.cpp");
+        fs::write(&source, "int old_value = 0;\n").expect("write source");
+        let command =
+            r#"python -c "from pathlib import Path; Path(r'memory_store.cpp').write_text('x')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("Python direct source write"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn allows_python_read_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("memory_store.cpp"), "int value = 0;\n").expect("write source");
+        let command =
+            r#"python -c "print(open(r'memory_store.cpp', 'r', encoding='utf-8').read())""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_python_write_to_new_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let command = r#"python -c "open(r'new_memory_store.cpp', 'w').write('int value = 0;\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_new_doc_with_python_write_example_for_existing_source_path() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("docs")).expect("create docs");
+        fs::create_dir_all(cwd.join("src")).expect("create src");
+        fs::write(cwd.join("src").join("memory_store.cpp"), "int value = 0;\n")
+            .expect("write source");
+
+        let command = r#"@'
+Example not executed:
+python -c "open(r'src\memory_store.cpp', 'w').write('x')"
+'@ | Set-Content -LiteralPath 'docs\PYTHON_NOTES.md' -Encoding utf8"#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
 use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
+use crate::tools::append_stressced_truncation_notice_if_needed;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::resolve_max_tokens;
 use codex_protocol::mcp::CallToolResult;
@@ -406,6 +407,15 @@ impl ExecCommandToolOutput {
         formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
     }
 
+    fn model_visible_truncated_output(&self, max_tokens: usize) -> String {
+        let text = String::from_utf8_lossy(&self.raw_output).to_string();
+        append_stressced_truncation_notice_if_needed(
+            &text,
+            formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens)),
+            std::env::var("CODEX_STRESSCED_MODE").is_ok(),
+        )
+    }
+
     fn response_text(&self) -> String {
         let mut sections = Vec::new();
 
@@ -429,7 +439,7 @@ impl ExecCommandToolOutput {
         }
 
         sections.push("Output:".to_string());
-        sections.push(self.truncated_output(self.model_output_max_tokens()));
+        sections.push(self.model_visible_truncated_output(self.model_output_max_tokens()));
 
         sections.join("\n")
     }

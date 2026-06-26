@@ -32,6 +32,7 @@ pub(crate) const TELEMETRY_PREVIEW_TRUNCATION_NOTICE: &str =
     "[... telemetry preview truncated ...]";
 const BINARY_OUTPUT_SAMPLE_CHARS: usize = 4096;
 const BINARY_OUTPUT_NOTICE: &str = "Output omitted: command output appears to be binary or encoded data and was not included to protect the model context. Inspect it with metadata, hashes, Format-Hex, or a targeted decoder instead of printing raw contents.";
+const STRESSCED_TRUNCATED_OUTPUT_NOTICE: &str = "CodexStressCed truncation notice: The output above was shortened by the tool-output truncation layer. Any '<N> tokens truncated', '<N> bytes truncated', or similar marker inserted by that layer is not command/file content. Re-read a smaller range or use a targeted search before citing or judging omitted text.";
 
 /// Legacy boundaries such as hook payloads, telemetry tags, and Responses tool
 /// names still require a single flattened string. Keep comparisons and sorting
@@ -73,13 +74,19 @@ pub fn format_exec_output_for_model(
 
     let total_lines = content.lines().count();
 
-    let formatted_output = truncate_text(&content, truncation_policy);
+    let truncated_output = truncate_text(&content, truncation_policy);
+    let output_was_truncated = truncated_output != content;
+    let formatted_output = append_stressced_truncation_notice_if_needed(
+        &content,
+        truncated_output,
+        stressced_mode_enabled(),
+    );
 
     let mut sections = Vec::new();
 
     sections.push(format!("Exit code: {}", exec_output.exit_code));
     sections.push(format!("Wall time: {duration_seconds} seconds"));
-    if total_lines != formatted_output.lines().count() {
+    if output_was_truncated {
         sections.push(format!("Total output lines: {total_lines}"));
     }
 
@@ -96,7 +103,11 @@ pub fn format_exec_output_str(
     let content = build_content_for_model(exec_output);
 
     // Truncate for model consumption before serialization.
-    formatted_truncate_text(&content, truncation_policy)
+    append_stressced_truncation_notice_if_needed(
+        &content,
+        formatted_truncate_text(&content, truncation_policy),
+        stressced_mode_enabled(),
+    )
 }
 
 fn build_content_with_optional_timeout(
@@ -150,6 +161,28 @@ fn looks_like_binary_output(text: &str) -> bool {
     suspicious_chars >= 8 || (checked_chars >= 80 && suspicious_chars * 100 / checked_chars >= 3)
 }
 
+pub(crate) fn append_stressced_truncation_notice_if_needed(
+    original: &str,
+    model_visible: String,
+    stressced_mode: bool,
+) -> String {
+    if !stressced_mode || model_visible == original || !has_truncation_marker(&model_visible) {
+        return model_visible;
+    }
+
+    format!("{model_visible}\n\n{STRESSCED_TRUNCATED_OUTPUT_NOTICE}")
+}
+
+fn has_truncation_marker(text: &str) -> bool {
+    text.contains("tokens truncated")
+        || text.contains("bytes truncated")
+        || text.contains("chars truncated")
+}
+
+fn stressced_mode_enabled() -> bool {
+    std::env::var("CODEX_STRESSCED_MODE").is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +225,44 @@ mod tests {
             formatted,
             "Exit code: 0\nWall time: 0 seconds\nOutput:\nhello\nworld\n"
         );
+    }
+
+    #[test]
+    fn stressced_truncation_notice_requires_actual_truncation() {
+        let original = "this file literally says tokens truncated";
+
+        let formatted = append_stressced_truncation_notice_if_needed(
+            original,
+            original.to_string(),
+            /*stressced_mode*/ true,
+        );
+
+        assert_eq!(formatted, original);
+    }
+
+    #[test]
+    fn stressced_truncation_notice_is_added_to_truncated_output() {
+        let original = "token one token two token three token four token five";
+        let truncated = formatted_truncate_text(original, TruncationPolicy::Tokens(4));
+
+        let formatted = append_stressced_truncation_notice_if_needed(
+            original, truncated, /*stressced_mode*/ true,
+        );
+
+        assert!(formatted.contains("tokens truncated"));
+        assert!(formatted.contains("CodexStressCed truncation notice"));
+        assert!(formatted.contains("not command/file content"));
+    }
+
+    #[test]
+    fn stressced_truncation_notice_is_disabled_outside_stressced_mode() {
+        let original = "token one token two token three token four token five";
+        let truncated = formatted_truncate_text(original, TruncationPolicy::Tokens(4));
+
+        let formatted = append_stressced_truncation_notice_if_needed(
+            original, truncated, /*stressced_mode*/ false,
+        );
+
+        assert!(!formatted.contains("CodexStressCed truncation notice"));
     }
 }
