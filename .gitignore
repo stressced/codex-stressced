@@ -121,6 +121,8 @@ codex-rs/ui/**/*.pak
 codex-rs/ui/**/*.bin
 codex-rs/ui/**/*.dat
 codex-rs/ui/codex-stressced-ui/dist-backend/
+codex-rs/ui/codex-stressced-ui/release-lite/
+codex-rs/ui/codex-stressced-ui/release-full/
 codex-rs/ui/codex-stressced-ui/main-*.js
 codex-rs/ui/codex-stressced-ui/main.cjs
 codex-rs/ui/codex-stressced-ui/build-*.txt

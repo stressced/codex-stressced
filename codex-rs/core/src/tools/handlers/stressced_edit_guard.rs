@@ -41,6 +41,9 @@ impl StresscedEditGuard {
         if let Some(reason) = command_usage_block_reason(command) {
             return Some(reason);
         }
+        if let Some(reason) = source_delete_block_reason(command, cwd) {
+            return Some(reason);
+        }
 
         let mut indicators = command_indicators(command);
         let python_direct_source_write = command_invokes_python(command)
@@ -174,28 +177,53 @@ impl StresscedEditGuard {
 }
 
 fn command_usage_block_reason(command: &str) -> Option<String> {
-    if command.contains("@'") || command.contains("@\"") || command.contains("<<") {
-        return None;
-    }
-
+    let has_powershell_here_string = command.contains("@'") || command.contains("@\"");
     let tokens = command_usage_tokens(&command.to_ascii_lowercase());
     let mut issues = Vec::new();
 
-    if tokens_contain_command(&tokens, |token| token == "head") {
+    if !has_powershell_here_string && invokes_safe_edit_tool_name_as_shell_command(&tokens) {
+        issues.push(
+            "- `safe_edit_*` / `mcp__safe_edit__...` names are MCP tool names, not PowerShell commands. If those tools are visible, call them through the tool interface. In shell-only sessions use `$env:SAFE_EDIT` instead.",
+        );
+    }
+
+    if !has_powershell_here_string && env_tool_without_call_operator(&tokens) {
+        issues.push(
+            "- PowerShell does not execute command paths stored in environment variables unless you use the call operator. Use `& $env:SAFE_EDIT --help` or `& $env:APPLY_PATCH`, not `$env:SAFE_EDIT --help`.",
+        );
+    }
+
+    if !has_powershell_here_string && command_contains_bash_heredoc(&tokens) {
+        issues.push(
+            "- Bash heredocs such as `cat <<EOF` or `python <<PY` do not run in PowerShell. Use PowerShell-compatible commands, MCP Safe Edit, or the `$env:SAFE_EDIT` wrapper with snippet files.",
+        );
+    }
+
+    if !has_powershell_here_string && apply_patch_dash_stdin_misuse(&tokens) {
+        issues.push(
+            "- Do not call `$env:APPLY_PATCH -`. When piping patch text, pass no `-`; for a patch file use `$env:APPLY_PATCH -File <patch-file>`.",
+        );
+    }
+
+    if !has_powershell_here_string && tokens_contain_command(&tokens, |token| token == "head") {
         issues.push(
             "- Unix `head` is not available in this PowerShell workspace. Use `... | Select-Object -First N` instead.",
         );
     }
 
-    if rg_tokens_contain(&tokens, |token| matches!(token, "-rn" | "-nr")) {
+    if !has_powershell_here_string
+        && rg_tokens_contain(&tokens, |token| matches!(token, "-rn" | "-nr"))
+    {
         issues.push(
             "- For ripgrep line numbers, use `rg -n \"pattern\" path`. Do not use `rg -rn`; `-r` is ripgrep replacement mode.",
         );
     }
 
-    if rg_tokens_contain(&tokens, |token| {
-        token == "--include" || token.starts_with("--include=")
-    }) {
+    if !has_powershell_here_string
+        && rg_tokens_contain(&tokens, |token| {
+            token == "--include" || token.starts_with("--include=")
+        })
+    {
         issues.push(
             "- This ripgrep build does not accept `--include`. Use `-g \"glob\"` or search a narrower path instead.",
         );
@@ -216,6 +244,80 @@ fn command_usage_block_reason(command: &str) -> Option<String> {
             .to_string(),
     );
     Some(lines.join("\n"))
+}
+
+fn invokes_safe_edit_tool_name_as_shell_command(tokens: &[String]) -> bool {
+    tokens_contain_command(tokens, |token| {
+        token.starts_with("mcp__safe_edit__")
+            || matches!(
+                token,
+                "safe_edit_inspect"
+                    | "safe_edit_replace_exact"
+                    | "safe_edit_insert_before"
+                    | "safe_edit_insert_after"
+                    | "safe_edit_create_file"
+                    | "safe_edit_append"
+                    | "safe_edit_diff"
+                    | "safe_edit_restore_backup"
+            )
+    })
+}
+
+fn env_tool_without_call_operator(tokens: &[String]) -> bool {
+    let mut expects_command = true;
+    let mut has_call_operator = false;
+    for token in tokens {
+        if is_command_separator(token) {
+            expects_command = true;
+            has_call_operator = false;
+            continue;
+        }
+        if expects_command && token == "&" {
+            has_call_operator = true;
+            continue;
+        }
+        if expects_command
+            && !has_call_operator
+            && matches!(token.as_str(), "$env:safe_edit" | "$env:apply_patch")
+        {
+            return true;
+        }
+        expects_command = false;
+        has_call_operator = false;
+    }
+    false
+}
+
+fn command_contains_bash_heredoc(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| token.starts_with("<<"))
+}
+
+fn apply_patch_dash_stdin_misuse(tokens: &[String]) -> bool {
+    let mut expects_command = true;
+    for (index, token) in tokens.iter().enumerate() {
+        if is_command_separator(token) {
+            expects_command = true;
+            continue;
+        }
+        if expects_command && token == "&" {
+            continue;
+        }
+        if expects_command && is_apply_patch_shell_command(token) {
+            return tokens.get(index + 1).is_some_and(|next| next == "-");
+        }
+        expects_command = false;
+    }
+    false
+}
+
+fn is_apply_patch_shell_command(token: &str) -> bool {
+    matches!(
+        token,
+        "$env:apply_patch" | "apply_patch" | "apply_patch.bat"
+    ) || token.ends_with("\\apply_patch.bat")
+        || token.ends_with("/apply_patch.bat")
+        || token.ends_with("\\apply_patch.ps1")
+        || token.ends_with("/apply_patch.ps1")
 }
 
 fn command_usage_tokens(value: &str) -> Vec<String> {
@@ -315,6 +417,15 @@ fn is_command_separator(token: &str) -> bool {
     matches!(token, "|" | ";" | "&&" | "||")
 }
 
+fn source_delete_block_reason(command: &str, cwd: &Path) -> Option<String> {
+    let targets = remove_item_source_targets(command, cwd);
+    let wildcard_patterns = remove_item_source_wildcard_patterns(command);
+    if targets.is_empty() && wildcard_patterns.is_empty() {
+        return None;
+    }
+    Some(format_delete_block_notice(&targets, &wildcard_patterns))
+}
+
 fn command_indicators(command: &str) -> Vec<&'static str> {
     let lower = command.to_ascii_lowercase();
     let mut indicators = Vec::new();
@@ -342,7 +453,7 @@ fn command_indicators(command: &str) -> Vec<&'static str> {
     if lower.contains("writealltext") {
         indicators.push("WriteAllText");
     }
-    if command.contains('>') {
+    if contains_unquoted_shell_redirection(command) {
         indicators.push("shell redirection");
     }
     indicators.sort_unstable();
@@ -357,11 +468,11 @@ fn existing_source_write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     for path in powershell_write_source_targets(command, cwd)
         .into_iter()
         .chain(shell_redirection_source_targets(command, cwd))
-        .chain(
-            use_script_targets
-                .then(|| script_write_source_targets(command, cwd))
-                .unwrap_or_default(),
-        )
+        .chain(if use_script_targets {
+            script_write_source_targets(command, cwd)
+        } else {
+            Default::default()
+        })
     {
         if matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file()) {
             targets.insert(normalize_existing_path(path));
@@ -395,11 +506,11 @@ fn powershell_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
 
             let mut found_flag_target = false;
             for pair in tokens[index + 1..].windows(2) {
-                if path_flags.contains(&pair[0].to_ascii_lowercase().as_str()) {
-                    if let Some(path) = candidate_path(Some(&pair[1]), cwd) {
-                        targets.insert(normalize_existing_path(path));
-                        found_flag_target = true;
-                    }
+                if path_flags.contains(&pair[0].to_ascii_lowercase().as_str())
+                    && let Some(path) = candidate_path(Some(&pair[1]), cwd)
+                {
+                    targets.insert(normalize_existing_path(path));
+                    found_flag_target = true;
                 }
             }
 
@@ -417,6 +528,78 @@ fn powershell_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
         }
     }
     targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn remove_item_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut targets = BTreeSet::new();
+    for segment in command.split(['|', ';']) {
+        let tokens = shell_like_tokens(segment);
+        if tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case("-whatif"))
+        {
+            continue;
+        }
+        for (index, token) in tokens.iter().enumerate() {
+            if !is_remove_item_command(token) {
+                continue;
+            }
+
+            let mut found_flag_target = false;
+            for pair in tokens[index + 1..].windows(2) {
+                if matches!(
+                    pair[0].to_ascii_lowercase().as_str(),
+                    "-literalpath" | "-path"
+                ) && let Some(path) = candidate_path(Some(&pair[1]), cwd)
+                    && matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file())
+                {
+                    targets.insert(normalize_existing_path(path));
+                    found_flag_target = true;
+                }
+            }
+
+            if !found_flag_target {
+                for candidate in &tokens[index + 1..] {
+                    if candidate.starts_with('-') {
+                        continue;
+                    }
+                    if let Some(path) = candidate_path(Some(candidate), cwd)
+                        && matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file())
+                    {
+                        targets.insert(normalize_existing_path(path));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn remove_item_source_wildcard_patterns(command: &str) -> Vec<String> {
+    let lower = command.to_ascii_lowercase();
+    let tokens = command_usage_tokens(&lower);
+    if tokens.iter().any(|token| token == "-whatif") {
+        return Vec::new();
+    }
+    if !tokens_contain_command(&tokens, is_remove_item_command) {
+        return Vec::new();
+    }
+
+    let mut patterns = BTreeSet::new();
+    for token in tokens {
+        if is_source_like_wildcard(&token) {
+            patterns.insert(token);
+        }
+    }
+    patterns.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn is_remove_item_command(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "remove-item" | "rm" | "del" | "erase"
+    )
 }
 
 fn shell_like_tokens(value: &str) -> Vec<String> {
@@ -450,8 +633,22 @@ fn shell_redirection_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut targets = BTreeSet::new();
     let chars = command.char_indices().collect::<Vec<_>>();
     let mut index = 0;
+    let mut quote = None;
     while index < chars.len() {
         let (byte_index, ch) = chars[index];
+        if matches!(ch, '"' | '\'') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            index += 1;
+            continue;
+        }
+        if quote.is_some() {
+            index += 1;
+            continue;
+        }
         if ch != '>' {
             index += 1;
             continue;
@@ -509,6 +706,24 @@ fn shell_redirection_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
 }
 
+fn contains_unquoted_shell_redirection(command: &str) -> bool {
+    let mut quote = None;
+    for ch in command.chars() {
+        if matches!(ch, '"' | '\'') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            continue;
+        }
+        if quote.is_none() && ch == '>' {
+            return true;
+        }
+    }
+    false
+}
+
 fn script_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut targets = BTreeSet::new();
     if let Ok(open_write) = Regex::new(
@@ -529,6 +744,13 @@ fn script_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    for (variable, path) in assigned_source_paths(command, cwd) {
+        if variable_is_opened_for_writing(command, &variable)
+            || variable_is_pathlib_written(command, &variable)
+        {
+            targets.insert(normalize_existing_path(path));
+        }
+    }
     if let Ok(write_all_text) = Regex::new(r#"WriteAllText\(\s*['"]([^'"\r\n]+)['"]"#) {
         for captures in write_all_text.captures_iter(command) {
             if let Some(path) = candidate_path(captures.get(1).map(|match_| match_.as_str()), cwd) {
@@ -537,6 +759,41 @@ fn script_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
         }
     }
     targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn assigned_source_paths(command: &str, cwd: &Path) -> Vec<(String, PathBuf)> {
+    let mut assignments = Vec::new();
+    if let Ok(assignment) =
+        Regex::new(r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rRuUbBfF]*['"]([^'"\r\n]+)['"]"#)
+    {
+        for captures in assignment.captures_iter(command) {
+            let Some(variable) = captures.get(1).map(|match_| match_.as_str().to_string()) else {
+                continue;
+            };
+            let Some(path) = candidate_path(captures.get(2).map(|match_| match_.as_str()), cwd)
+            else {
+                continue;
+            };
+            assignments.push((variable, path));
+        }
+    }
+    assignments
+}
+
+fn variable_is_opened_for_writing(command: &str, variable: &str) -> bool {
+    let pattern = format!(
+        r#"open\(\s*{}\s*,\s*[rRuUbBfF]*['"][^'"\r\n]*[wa][^'"\r\n]*['"]"#,
+        variable
+    );
+    Regex::new(&pattern).is_ok_and(|open_write| open_write.is_match(command))
+}
+
+fn variable_is_pathlib_written(command: &str, variable: &str) -> bool {
+    let pattern = format!(
+        r#"(?:Path|pathlib\.Path)\(\s*{}\s*\)\.write_(?:text|bytes)\s*\("#,
+        variable
+    );
+    Regex::new(&pattern).is_ok_and(|pathlib_write| pathlib_write.is_match(command))
 }
 
 fn extract_source_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
@@ -605,6 +862,10 @@ fn is_source_like_path(path: &Path) -> bool {
     let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
         return false;
     };
+    is_source_like_extension(extension)
+}
+
+fn is_source_like_extension(extension: &str) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
         "c" | "cc"
@@ -638,6 +899,23 @@ fn is_source_like_path(path: &Path) -> bool {
             | "xml"
             | "ps1"
     )
+}
+
+fn is_source_like_wildcard(token: &str) -> bool {
+    if !token.contains('*') {
+        return false;
+    }
+    let trimmed = token.trim_matches(|ch| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+        )
+    });
+    let Some((_, extension)) = trimmed.rsplit_once('.') else {
+        return false;
+    };
+    let extension = extension.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    !extension.is_empty() && is_source_like_extension(extension)
 }
 
 fn normalize_existing_path(path: PathBuf) -> PathBuf {
@@ -756,7 +1034,11 @@ fn format_block_notice(indicators: &[&str], targets: &[PathBuf]) -> String {
             .to_string(),
     );
     lines.push(
-        "- For existing source edits, use `safe_edit_replace_exact`, `safe_edit_insert_before`, `safe_edit_insert_after`, or `$env:APPLY_PATCH` with a targeted patch."
+        "- If MCP safe_edit tools are visible, call them through the tool interface. Do not type `mcp__safe_edit__...` or `safe_edit_*` names inside `shell_command`."
+            .to_string(),
+    );
+    lines.push(
+        "- In shell-only sessions, use `$env:SAFE_EDIT` with snippet files or `$env:APPLY_PATCH` with stdin / `-File <patch-file>`."
             .to_string(),
     );
     lines.push(
@@ -766,6 +1048,34 @@ fn format_block_notice(indicators: &[&str], targets: &[PathBuf]) -> String {
     lines.push("- Existing target(s):".to_string());
     for target in targets {
         lines.push(format!("  - {}", target.display()));
+    }
+    lines.join("\n")
+}
+
+fn format_delete_block_notice(targets: &[PathBuf], wildcard_patterns: &[String]) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        "CodexStressCed file safety block: refused to delete source-like file(s).".to_string(),
+    );
+    lines.push(
+        "- `Remove-Item`/`rm`/`del` is destructive and hard to review for source, config, and documentation files."
+            .to_string(),
+    );
+    lines.push(
+        "- If deleting a tracked file is intentional, use a targeted `apply_patch` delete so the diff is explicit. If this is only cleanup, remove non-source scratch artifacts or ask before deleting source-like files."
+            .to_string(),
+    );
+    if !targets.is_empty() {
+        lines.push("- Existing source-like target(s):".to_string());
+        for target in targets {
+            lines.push(format!("  - {}", target.display()));
+        }
+    }
+    if !wildcard_patterns.is_empty() {
+        lines.push("- Source-like wildcard pattern(s):".to_string());
+        for pattern in wildcard_patterns {
+            lines.push(format!("  - {pattern}"));
+        }
     }
     lines.join("\n")
 }
@@ -917,6 +1227,154 @@ new content
     }
 
     #[test]
+    fn blocks_mcp_safe_edit_tool_name_used_as_shell_command() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"mcp__safe_edit__safe_edit_inspect -Path "src\thing.cpp""#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("MCP tool names"));
+        assert!(reason.contains("$env:SAFE_EDIT"));
+    }
+
+    #[test]
+    fn blocks_plain_safe_edit_tool_name_used_as_shell_command() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"safe_edit_create_file --path "tests\new_test.cpp""#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("MCP tool names"));
+        assert!(reason.contains("shell-only"));
+    }
+
+    #[test]
+    fn allows_quoted_safe_edit_tool_name_instruction() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "Do not run mcp__safe_edit__safe_edit_inspect in shell""#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_safe_edit_env_var_without_call_operator() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(r#"$env:SAFE_EDIT --help"#, temp.path())
+            .expect("block reason");
+
+        assert!(reason.contains("call operator"));
+        assert!(reason.contains("& $env:SAFE_EDIT --help"));
+    }
+
+    #[test]
+    fn allows_safe_edit_env_var_with_call_operator() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(r#"& $env:SAFE_EDIT --help"#, temp.path());
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_apply_patch_env_var_without_call_operator() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason =
+            StresscedEditGuard::block_reason(r#"$env:APPLY_PATCH -File patch.diff"#, temp.path())
+                .expect("block reason");
+
+        assert!(reason.contains("call operator"));
+        assert!(reason.contains("& $env:APPLY_PATCH"));
+    }
+
+    #[test]
+    fn blocks_bash_heredoc_in_powershell() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"python - <<'PY'
+print("hello")
+PY"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Bash heredocs"));
+        assert!(reason.contains("PowerShell"));
+    }
+
+    #[test]
+    fn allows_quoted_bash_heredoc_text_that_is_not_a_command() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason =
+            StresscedEditGuard::block_reason(r#"Write-Output "python - <<'PY'""#, temp.path());
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_powershell_here_string_with_shift_operator_text() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"@'
+auto shifted = value << 1;
+'@ | Set-Content -LiteralPath 'new_test.cpp' -Encoding utf8"#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_apply_patch_stdin_dash_misuse() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Get-Content patch.diff | & $env:APPLY_PATCH -"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Do not call `$env:APPLY_PATCH -`"));
+        assert!(reason.contains("-File <patch-file>"));
+    }
+
+    #[test]
+    fn allows_apply_patch_stdin_without_dash() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Get-Content patch.diff | & $env:APPLY_PATCH"#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_apply_patch_file_argument() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason =
+            StresscedEditGuard::block_reason(r#"& $env:APPLY_PATCH -File patch.diff"#, temp.path());
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
     fn allows_power_shell_first_limit_and_rg_line_numbers() {
         let temp = tempdir().expect("tempdir");
 
@@ -926,6 +1384,43 @@ new content
         );
 
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_rg_pattern_with_arrow_into_existing_source_path() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("tests")).expect("create tests");
+        fs::write(
+            cwd.join("tests")
+                .join("control_external_replay_state_store_contracts_test.cpp"),
+            "store->create();\n",
+        )
+        .expect("write source");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg -n "^\s+store->" tests/control_external_replay_state_store_contracts_test.cpp"#,
+            cwd,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_unquoted_redirection_to_existing_source_path() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("timeres.cpp");
+        fs::write(&source, "int main(void) { return 0; }\n").expect("write source");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "int main(void) { return 1; }" > timeres.cpp"#,
+            cwd,
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("shell redirection"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
     }
 
     #[test]
@@ -1078,6 +1573,113 @@ The existing local baseline is `tests\local_control_runtime_smoke_harness_test.c
     }
 
     #[test]
+    fn blocks_remove_item_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("timeres.c");
+        fs::write(&source, "int main(void) { return 0; }\n").expect("write source");
+
+        let reason =
+            StresscedEditGuard::block_reason(r#"Remove-Item -LiteralPath "timeres.c" -Force"#, cwd)
+                .expect("block reason");
+
+        assert!(reason.contains("refused to delete source-like file"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_rm_alias_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("timeres.cpp");
+        fs::write(&source, "int main(void) { return 0; }\n").expect("write source");
+
+        let reason =
+            StresscedEditGuard::block_reason(r#"rm "timeres.cpp""#, cwd).expect("block reason");
+
+        assert!(reason.contains("Remove-Item"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_remove_item_source_wildcard_pipeline() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Get-ChildItem -Recurse -Filter *.cpp | Remove-Item -Force"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Source-like wildcard"));
+        assert!(reason.contains("*.cpp"));
+    }
+
+    #[test]
+    fn allows_remove_item_what_if_for_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("timeres.c"), "int main(void) { return 0; }\n").expect("write source");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Remove-Item -LiteralPath "timeres.c" -WhatIf"#,
+            cwd,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_remove_item_what_if_for_source_wildcard() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Get-ChildItem -Recurse -Filter *.cpp | Remove-Item -WhatIf"#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_remove_item_of_non_source_scratch_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("scratch.patch"), "*** Begin Patch\n").expect("write scratch");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Remove-Item -LiteralPath "scratch.patch" -Force"#,
+            cwd,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_remove_item_of_build_directory() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("build")).expect("create build dir");
+
+        let reason =
+            StresscedEditGuard::block_reason(r#"Remove-Item -Recurse -Force "build""#, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_quoted_remove_item_instruction() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "Do not run Remove-Item timeres.cpp""#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
     fn allows_shell_write_to_new_markdown_file() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
@@ -1127,6 +1729,24 @@ with open(r"memory_store.cpp", "w", encoding="utf-8") as handle:
     }
 
     #[test]
+    fn blocks_python_variable_path_rewrite_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("memory_store.cpp");
+        fs::write(&source, "int old_value = 0;\n").expect("write source");
+        let command = r#"python -c "
+path = r'memory_store.cpp'
+with open(path, 'w', encoding='utf-8') as handle:
+    handle.write('int new_value = 1;\n')
+""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("Python direct source write"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
     fn blocks_pathlib_write_text_of_existing_source_file() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
@@ -1134,6 +1754,24 @@ with open(r"memory_store.cpp", "w", encoding="utf-8") as handle:
         fs::write(&source, "int old_value = 0;\n").expect("write source");
         let command =
             r#"python -c "from pathlib import Path; Path(r'memory_store.cpp').write_text('x')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("Python direct source write"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_pathlib_variable_path_write_text_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("memory_store.cpp");
+        fs::write(&source, "int old_value = 0;\n").expect("write source");
+        let command = r#"python -c "
+from pathlib import Path
+target = r'memory_store.cpp'
+Path(target).write_text('int new_value = 1;\n')
+""#;
 
         let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
 
@@ -1163,6 +1801,21 @@ with open(r"memory_store.cpp", "w", encoding="utf-8") as handle:
         fs::write(cwd.join("memory_store.cpp"), "int value = 0;\n").expect("write source");
         let command =
             r#"python -c "print(open(r'memory_store.cpp', 'r', encoding='utf-8').read())""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_python_variable_path_read_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("memory_store.cpp"), "int value = 0;\n").expect("write source");
+        let command = r#"python -c "
+path = r'memory_store.cpp'
+print(open(path, 'r', encoding='utf-8').read())
+""#;
 
         let reason = StresscedEditGuard::block_reason(command, cwd);
 
