@@ -620,6 +620,8 @@ fn is_source_like_path(path: &Path) -> bool {
             | "jsx"
             | "mjs"
             | "json"
+            | "md"
+            | "markdown"
             | "toml"
             | "yaml"
             | "yml"
@@ -1016,6 +1018,44 @@ int main(void) { return 1; }
     }
 
     #[test]
+    fn blocks_out_file_rewrite_of_existing_markdown_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let dispatch = cwd.join("DISPATCH.md");
+        fs::write(&dispatch, "# Dispatch\n\nOriginal body.\n").expect("write markdown");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"$content = Get-Content "DISPATCH.md" -Encoding utf8; $content | Out-File "DISPATCH.md" -Encoding utf8 -NoNewline"#,
+            cwd,
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Out-File"));
+        assert!(reason.contains(&normalize_existing_path(dispatch).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_set_content_rewrite_of_existing_markdown_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let current = cwd.join("CURRENT.md");
+        fs::write(&current, "# Current\n\nOriginal body.\n").expect("write markdown");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"@'
+# Current
+
+Rewritten body.
+'@ | Set-Content -LiteralPath 'CURRENT.md' -Encoding utf8"#,
+            cwd,
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Set-Content"));
+        assert!(reason.contains(&normalize_existing_path(current).display().to_string()));
+    }
+
+    #[test]
     fn allows_new_doc_with_existing_source_path_in_content() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
@@ -1033,6 +1073,19 @@ The existing local baseline is `tests\local_control_runtime_smoke_harness_test.c
 '@ | Set-Content -LiteralPath 'docs\CONTROL_TRANSPORT_DESIGN.md' -Encoding utf8"#;
 
         let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_shell_write_to_new_markdown_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+
+        let reason = StresscedEditGuard::block_reason(
+            r##""# New Notes" | Out-File "NOTES.md" -Encoding utf8"##,
+            cwd,
+        );
 
         assert_eq!(reason, None);
     }
@@ -1089,12 +1142,39 @@ with open(r"memory_store.cpp", "w", encoding="utf-8") as handle:
     }
 
     #[test]
+    fn blocks_python_rewrite_of_existing_markdown_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let dispatch = cwd.join("DISPATCH.md");
+        fs::write(&dispatch, "# Dispatch\n\nOriginal body.\n").expect("write markdown");
+        let command =
+            r#"python -c "open(r'DISPATCH.md', 'w', encoding='utf-8').write('# Dispatch\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("Python direct source write"));
+        assert!(reason.contains(&normalize_existing_path(dispatch).display().to_string()));
+    }
+
+    #[test]
     fn allows_python_read_of_existing_source_file() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
         fs::write(cwd.join("memory_store.cpp"), "int value = 0;\n").expect("write source");
         let command =
             r#"python -c "print(open(r'memory_store.cpp', 'r', encoding='utf-8').read())""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_python_read_of_existing_markdown_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("DISPATCH.md"), "# Dispatch\n").expect("write markdown");
+        let command = r#"python -c "print(open(r'DISPATCH.md', 'r', encoding='utf-8').read())""#;
 
         let reason = StresscedEditGuard::block_reason(command, cwd);
 
