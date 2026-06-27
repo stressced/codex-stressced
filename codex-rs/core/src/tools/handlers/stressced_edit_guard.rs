@@ -245,6 +245,12 @@ fn command_usage_block_reason(command: &str) -> Option<String> {
         );
     }
 
+    if !has_powershell_here_string && rg_has_many_alternation_terms(command) {
+        issues.push(
+            "- Do not put many symbols into one huge `rg \"a|b|...\"` alternation. Split the search into 2-4 smaller `rg` calls or search one specific pattern at a time with a narrow path/glob and capped output.",
+        );
+    }
+
     if issues.is_empty() {
         return None;
     }
@@ -427,6 +433,99 @@ fn rg_tokens_contain(tokens: &[String], predicate: impl Fn(&str) -> bool) -> boo
         expects_command = false;
     }
     false
+}
+
+fn rg_has_many_alternation_terms(command: &str) -> bool {
+    const MAX_RG_ALTERNATION_PIPES: usize = 8;
+
+    let command_without_here_strings = command_without_powershell_here_strings(command);
+    let tokens = shell_like_tokens(&command_without_here_strings.to_ascii_lowercase());
+    let mut expects_command = true;
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if is_command_separator(token) {
+            expects_command = true;
+            index += 1;
+            continue;
+        }
+        if expects_command && token == "&" {
+            index += 1;
+            continue;
+        }
+        if !expects_command || !matches!(token.as_str(), "rg" | "rg.exe") {
+            expects_command = false;
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 1;
+        while cursor < tokens.len() && !is_command_separator(&tokens[cursor]) {
+            let candidate = &tokens[cursor];
+            if candidate == "-e" || candidate == "--regexp" {
+                if tokens.get(cursor + 1).is_some_and(|pattern| {
+                    unescaped_pipe_count(pattern) >= MAX_RG_ALTERNATION_PIPES
+                }) {
+                    return true;
+                }
+                cursor += 2;
+                continue;
+            }
+            if rg_option_consumes_next(candidate) {
+                cursor += 2;
+                continue;
+            }
+            if candidate.starts_with('-') {
+                cursor += 1;
+                continue;
+            }
+
+            return unescaped_pipe_count(candidate) >= MAX_RG_ALTERNATION_PIPES;
+        }
+
+        expects_command = false;
+        index = cursor + 1;
+    }
+
+    false
+}
+
+fn rg_option_consumes_next(token: &str) -> bool {
+    matches!(
+        token,
+        "-g" | "--glob"
+            | "--iglob"
+            | "-t"
+            | "--type"
+            | "-f"
+            | "--file"
+            | "--path-separator"
+            | "--sort"
+            | "--sortr"
+            | "--encoding"
+    )
+}
+
+fn unescaped_pipe_count(pattern: &str) -> usize {
+    let mut escaped = false;
+    let mut count = 0;
+
+    for ch in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '|' {
+            count += 1;
+        }
+    }
+
+    count
 }
 
 fn get_content_tokens_contain(tokens: &[String], predicate: impl Fn(&str) -> bool) -> bool {
@@ -1436,6 +1535,70 @@ new content
 
         assert!(reason.contains("does not accept `--include`"));
         assert!(reason.contains("-g \"glob\""));
+    }
+
+    #[test]
+    fn blocks_rg_mega_alternation_with_split_hint() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg -n "alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliet|kilo" src tests"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("huge `rg"));
+        assert!(reason.contains("2-4 smaller"));
+    }
+
+    #[test]
+    fn blocks_rg_mega_alternation_after_glob_option() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg -n -g "*.cpp" "alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliet" tests"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("one specific pattern"));
+    }
+
+    #[test]
+    fn blocks_rg_mega_alternation_after_type_flag() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg -n -tcpp "alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliet" tests"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("2-4 smaller"));
+    }
+
+    #[test]
+    fn allows_small_rg_alternation() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"rg -n "alpha|bravo|charlie" tests -g "*.cpp" | Select-Object -First 80"#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_quoted_rg_mega_alternation_instruction() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "Do not run rg -n 'alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliet' src""#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
     }
 
     #[test]
