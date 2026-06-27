@@ -44,6 +44,9 @@ impl StresscedEditGuard {
         if let Some(reason) = source_delete_block_reason(command, cwd) {
             return Some(reason);
         }
+        if let Some(reason) = new_source_script_write_block_reason(command, cwd) {
+            return Some(reason);
+        }
 
         let mut indicators = command_indicators(command);
         let python_direct_source_write = command_invokes_python(command)
@@ -208,6 +211,19 @@ fn command_usage_block_reason(command: &str) -> Option<String> {
     if !has_powershell_here_string && tokens_contain_command(&tokens, |token| token == "head") {
         issues.push(
             "- Unix `head` is not available in this PowerShell workspace. Use `... | Select-Object -First N` instead.",
+        );
+    }
+
+    if !has_powershell_here_string && get_content_tokens_contain(&tokens, |token| token == "-skip")
+    {
+        issues.push(
+            "- `Get-Content` does not accept `-Skip` in this PowerShell workspace. Use `Get-Content <path> | Select-Object -Skip N -First M` instead.",
+        );
+    }
+
+    if !has_powershell_here_string && get_content_pipeline_has_open_ended_skip(&tokens) {
+        issues.push(
+            "- `Get-Content ... | Select-Object -Skip N` can dump the rest of a large file. Add `-First M` (usually 40-80 lines) or use `Select-String -Context` for targeted reads.",
         );
     }
 
@@ -413,6 +429,79 @@ fn rg_tokens_contain(tokens: &[String], predicate: impl Fn(&str) -> bool) -> boo
     false
 }
 
+fn get_content_tokens_contain(tokens: &[String], predicate: impl Fn(&str) -> bool) -> bool {
+    let mut expects_command = true;
+    for (index, token) in tokens.iter().enumerate() {
+        if is_command_separator(token) {
+            expects_command = true;
+            continue;
+        }
+        if expects_command && token == "&" {
+            continue;
+        }
+        if !expects_command || !is_get_content_command(token) {
+            expects_command = false;
+            continue;
+        }
+
+        for token in &tokens[index + 1..] {
+            if is_command_separator(token) {
+                break;
+            }
+            if predicate(token) {
+                return true;
+            }
+        }
+
+        expects_command = false;
+    }
+    false
+}
+
+fn get_content_pipeline_has_open_ended_skip(tokens: &[String]) -> bool {
+    let mut index = 0;
+    let mut previous_get_content_pipe = false;
+
+    while index < tokens.len() {
+        while tokens.get(index).is_some_and(|token| token == "&") {
+            index += 1;
+        }
+        if index >= tokens.len() {
+            break;
+        }
+
+        let command = tokens[index].as_str();
+        let segment_start = index;
+        let mut cursor = index + 1;
+        while cursor < tokens.len() && !is_command_separator(&tokens[cursor]) {
+            cursor += 1;
+        }
+        let segment = &tokens[segment_start..cursor];
+
+        if previous_get_content_pipe && is_select_object_command(command) {
+            let has_skip = segment.iter().any(|token| token == "-skip");
+            let has_first = segment.iter().any(|token| token == "-first");
+            if has_skip && !has_first {
+                return true;
+            }
+        }
+
+        let separator = tokens.get(cursor).map(String::as_str);
+        previous_get_content_pipe = is_get_content_command(command) && separator == Some("|");
+        index = cursor + 1;
+    }
+
+    false
+}
+
+fn is_get_content_command(token: &str) -> bool {
+    matches!(token, "get-content" | "gc" | "cat" | "type")
+}
+
+fn is_select_object_command(token: &str) -> bool {
+    matches!(token, "select-object" | "select")
+}
+
 fn is_command_separator(token: &str) -> bool {
     matches!(token, "|" | ";" | "&&" | "||")
 }
@@ -481,8 +570,41 @@ fn existing_source_write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
     targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
 }
 
+fn new_source_script_write_block_reason(command: &str, cwd: &Path) -> Option<String> {
+    if !command_invokes_python(command) {
+        return None;
+    }
+
+    let targets = script_write_source_targets(command, cwd)
+        .into_iter()
+        .filter(|path| !matches!(fs::metadata(path), Ok(metadata) if metadata.is_file()))
+        .filter(|path| is_workspace_source_write_target(path, cwd))
+        .filter(|path| !is_root_scratch_artifact_path(path, cwd))
+        .collect::<Vec<_>>();
+
+    if targets.is_empty() {
+        None
+    } else {
+        Some(format_new_source_script_write_block_notice(&targets))
+    }
+}
+
+fn is_workspace_source_write_target(path: &Path, cwd: &Path) -> bool {
+    if !is_source_like_path(path) {
+        return false;
+    }
+
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    absolute_path == cwd || absolute_path.strip_prefix(cwd).is_ok()
+}
+
 fn command_invokes_python(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
+    let command_without_here_strings = command_without_powershell_here_strings(command);
+    let lower = command_without_here_strings.to_ascii_lowercase();
     let tokens = shell_like_tokens(&lower);
     tokens
         .iter()
@@ -490,6 +612,40 @@ fn command_invokes_python(command: &str) -> bool {
         || lower.contains("| python")
         || lower.contains("| python3")
         || lower.contains("| py")
+}
+
+fn command_without_powershell_here_strings(command: &str) -> String {
+    let mut stripped = String::with_capacity(command.len());
+    let mut cursor = 0;
+
+    loop {
+        let rest = &command[cursor..];
+        let single_start = rest.find("@'");
+        let double_start = rest.find("@\"");
+        let Some((start, quote)) = (match (single_start, double_start) {
+            (Some(single), Some(double)) if single < double => Some((single, '\'')),
+            (Some(_), Some(double)) => Some((double, '"')),
+            (Some(single), None) => Some((single, '\'')),
+            (None, Some(double)) => Some((double, '"')),
+            (None, None) => None,
+        }) else {
+            stripped.push_str(rest);
+            break;
+        };
+
+        stripped.push_str(&rest[..start]);
+        let here_string_body = &rest[start + 2..];
+        let terminator = format!("{quote}@");
+        let Some(end) = here_string_body.find(&terminator) else {
+            stripped.push_str(rest);
+            break;
+        };
+
+        stripped.push(' ');
+        cursor += start + 2 + end + terminator.len();
+    }
+
+    stripped
 }
 
 fn powershell_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
@@ -552,6 +708,7 @@ fn remove_item_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
                     "-literalpath" | "-path"
                 ) && let Some(path) = candidate_path(Some(&pair[1]), cwd)
                     && matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file())
+                    && !is_root_scratch_artifact_path(&path, cwd)
                 {
                     targets.insert(normalize_existing_path(path));
                     found_flag_target = true;
@@ -565,6 +722,7 @@ fn remove_item_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
                     }
                     if let Some(path) = candidate_path(Some(candidate), cwd)
                         && matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file())
+                        && !is_root_scratch_artifact_path(&path, cwd)
                     {
                         targets.insert(normalize_existing_path(path));
                         break;
@@ -574,6 +732,35 @@ fn remove_item_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
         }
     }
     targets.into_iter().take(MAX_TARGETS_PER_COMMAND).collect()
+}
+
+fn is_root_scratch_artifact_path(path: &Path, cwd: &Path) -> bool {
+    let normalized_cwd = normalize_existing_path(cwd.to_path_buf());
+    let parent = path.parent().map(Path::to_path_buf);
+    if parent.map(normalize_existing_path).as_ref() != Some(&normalized_cwd) {
+        return false;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = file_name.to_ascii_lowercase();
+
+    (lower.starts_with('t')
+        && lower.ends_with(".xml")
+        && lower[1..lower.len() - ".xml".len()]
+            .chars()
+            .all(|ch| ch.is_ascii_digit()))
+        || (lower.starts_with("temp_")
+            && matches!(
+                Path::new(&lower).extension().and_then(|ext| ext.to_str()),
+                Some("diff" | "patch" | "py" | "txt")
+            ))
+        || matches!(lower.as_str(), "test_all.xml" | "test_junit.xml")
+        || (lower.ends_with(".xml")
+            && (lower.ends_with("_results.xml") || lower.contains("_results_")))
+        || (lower.starts_with("contracts_test") && lower.ends_with(".xml"))
+        || (lower.starts_with("safety") && lower.ends_with(".txt"))
 }
 
 fn remove_item_source_wildcard_patterns(command: &str) -> Vec<String> {
@@ -1052,6 +1239,31 @@ fn format_block_notice(indicators: &[&str], targets: &[PathBuf]) -> String {
     lines.join("\n")
 }
 
+fn format_new_source_script_write_block_notice(targets: &[PathBuf]) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        "CodexStressCed file safety block: refused Python as the direct writer for new source-like file(s)."
+            .to_string(),
+    );
+    lines.push(
+        "- When MCP Safe Edit is available, create new source/config/docs with `safe_edit_create_file` or a small `safe_edit_create_file` skeleton followed by `safe_edit_append` chunks."
+            .to_string(),
+    );
+    lines.push(
+        "- Python is still allowed for reading, analysis, calculations, validation, and printing snippets; do not use it to write the target source file directly."
+            .to_string(),
+    );
+    lines.push(
+        "- Root scratch artifacts such as `temp_*.py`, `temp_*.patch`, `t1.xml`, and `*_results.xml` remain cleanup/scratch files, not project source."
+            .to_string(),
+    );
+    lines.push("- New source-like target(s):".to_string());
+    for target in targets {
+        lines.push(format!("  - {}", target.display()));
+    }
+    lines.join("\n")
+}
+
 fn format_delete_block_notice(targets: &[PathBuf], wildcard_patterns: &[String]) -> String {
     let mut lines = Vec::new();
     lines.push(
@@ -1387,6 +1599,59 @@ auto shifted = value << 1;
     }
 
     #[test]
+    fn blocks_get_content_skip_parameter() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Get-Content docs/control/design.md -Skip 120 -TotalCount 120"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Get-Content"));
+        assert!(reason.contains("does not accept `-Skip`"));
+        assert!(reason.contains("Select-Object -Skip N -First M"));
+    }
+
+    #[test]
+    fn allows_get_content_pipeline_skip_with_first_limit() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Get-Content docs/control/design.md | Select-Object -Skip 120 -First 60"#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_get_content_pipeline_skip_without_first_limit() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Get-Content docs/control/design.md | Select-Object -Skip 360"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("can dump the rest of a large file"));
+        assert!(reason.contains("Add `-First M`"));
+    }
+
+    #[test]
+    fn allows_quoted_get_content_skip_instruction() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "Do not use Get-Content file -Skip 120""#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
     fn allows_rg_pattern_with_arrow_into_existing_source_path() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
@@ -1656,6 +1921,86 @@ The existing local baseline is `tests\local_control_runtime_smoke_harness_test.c
     }
 
     #[test]
+    fn allows_remove_item_of_root_test_xml_scratch_artifacts() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        for file_name in [
+            "T054_results.xml",
+            "T054_results_full.xml",
+            "contracts_test.xml",
+            "contracts_test2.xml",
+            "t4.xml",
+            "test_all.xml",
+            "test_junit.xml",
+        ] {
+            fs::write(cwd.join(file_name), "<testsuite />\n").expect("write scratch xml");
+        }
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Remove-Item T054_results.xml, T054_results_full.xml, contracts_test.xml, contracts_test2.xml, t4.xml, test_all.xml, test_junit.xml -Force"#,
+            cwd,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_remove_item_of_root_temp_source_like_scratch_artifacts() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        for file_name in [
+            "temp_bare_calls.txt",
+            "temp_contracts_fix.patch",
+            "temp_fix_contracts.py",
+            "temp_patch.diff",
+            "safety1.txt",
+        ] {
+            fs::write(cwd.join(file_name), "scratch\n").expect("write scratch file");
+        }
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Remove-Item temp_bare_calls.txt, temp_contracts_fix.patch, temp_fix_contracts.py, temp_patch.diff, safety1.txt -Force"#,
+            cwd,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_remove_item_of_non_scratch_root_xml_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let manifest = cwd.join("AndroidManifest.xml");
+        fs::write(&manifest, "<manifest />\n").expect("write xml");
+
+        let reason =
+            StresscedEditGuard::block_reason(r#"Remove-Item AndroidManifest.xml -Force"#, cwd)
+                .expect("block reason");
+
+        assert!(reason.contains("refused to delete source-like file"));
+        assert!(reason.contains(&normalize_existing_path(manifest).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_remove_item_of_temp_source_like_artifact_outside_workspace_root() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let tests = cwd.join("tests");
+        fs::create_dir_all(&tests).expect("create tests");
+        let source = tests.join("temp_fix_contracts.py");
+        fs::write(&source, "print('not root scratch')\n").expect("write source");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Remove-Item tests\temp_fix_contracts.py -Force"#,
+            cwd,
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("refused to delete source-like file"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
     fn allows_remove_item_of_build_directory() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
@@ -1726,6 +2071,29 @@ with open(r"memory_store.cpp", "w", encoding="utf-8") as handle:
 
         assert!(reason.contains("Python direct source write"));
         assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn blocks_here_string_python_write_to_new_source_when_piped_to_python() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let command = r#"@'
+from pathlib import Path
+Path(r"tests\new_contract_test.cpp").write_text("int value = 1;\n")
+'@ | python"#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("refused Python as the direct writer"));
+        assert!(reason.contains("safe_edit_create_file"));
+        assert!(
+            reason.contains(
+                &cwd.join("tests")
+                    .join("new_contract_test.cpp")
+                    .display()
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -1835,10 +2203,44 @@ print(open(path, 'r', encoding='utf-8').read())
     }
 
     #[test]
-    fn allows_python_write_to_new_source_file() {
+    fn blocks_python_write_to_new_source_file() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
         let command = r#"python -c "open(r'new_memory_store.cpp', 'w').write('int value = 0;\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("refused Python as the direct writer"));
+        assert!(reason.contains("safe_edit_create_file"));
+        assert!(reason.contains(&cwd.join("new_memory_store.cpp").display().to_string()));
+    }
+
+    #[test]
+    fn blocks_pathlib_write_text_to_new_nested_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("tests")).expect("create tests");
+        let command = r#"python -c "from pathlib import Path; Path(r'tests\new_contract_test.cpp').write_text('int value = 0;\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("refused Python as the direct writer"));
+        assert!(reason.contains("safe_edit_create_file"));
+        assert!(
+            reason.contains(
+                &cwd.join("tests")
+                    .join("new_contract_test.cpp")
+                    .display()
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn allows_python_write_to_root_temp_scratch_script() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let command = r#"python -c "open(r'temp_t056_writer.py', 'w').write('print(1)\n')""#;
 
         let reason = StresscedEditGuard::block_reason(command, cwd);
 
@@ -1857,6 +2259,22 @@ print(open(path, 'r', encoding='utf-8').read())
         let command = r#"@'
 Example not executed:
 python -c "open(r'src\memory_store.cpp', 'w').write('x')"
+'@ | Set-Content -LiteralPath 'docs\PYTHON_NOTES.md' -Encoding utf8"#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_new_doc_with_python_write_example_for_new_source_path() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("docs")).expect("create docs");
+
+        let command = r#"@'
+Example not executed:
+python -c "open(r'tests\new_contract_test.cpp', 'w').write('x')"
 '@ | Set-Content -LiteralPath 'docs\PYTHON_NOTES.md' -Encoding utf8"#;
 
         let reason = StresscedEditGuard::block_reason(command, cwd);
