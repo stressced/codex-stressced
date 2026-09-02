@@ -1,8 +1,12 @@
 
-const loadingThreads = new Set<string>();
+let historyRequestVersion = 0;
 // src/store.ts
 import { create } from "zustand";
 import { rpc, onNotification, onConnectionStatus, ConnectionState, getLastError } from "./rpc";
+import { prependTurns, transcriptFromTurns, upsertCompletedMessage, type Message, type Role, type ThinkingMessage, type ToolCall, type ThreadReadResponse, type ThreadTurn, type TurnsPage } from "./history";
+import type { ContextUsage } from "./ContextStatus";
+import { COMPUTER_TOOL_SPEC } from "./computerTool";
+export type { Message, Role, ThinkingMessage, ToolCall } from "./history";
 
 const FULL_ACCESS_SANDBOX_POLICY = { type: "dangerFullAccess" };
 const FULL_ACCESS_APPROVAL_POLICY = "never";
@@ -12,7 +16,9 @@ const LIMITED_SANDBOX_POLICY = {
   networkAccess: false,
 };
 const LIMITED_APPROVAL_POLICY = "on-failure";
-const LOCAL_IMAGE_PATH_REGEX = /[A-Za-z]:\\[^\r\n"'<>|?*]+?\.(?:png|jpe?g|webp|bmp|gif)/gi;
+const QUOTED_IMAGE_PATH_REGEX = /(["'])([^"'\r\n]+?\.(?:png|jpe?g|webp|bmp|gif))\1/gi;
+const ABSOLUTE_IMAGE_PATH_REGEX = /[A-Za-z]:[\\/][^\r\n"'<>|?*]+?\.(?:png|jpe?g|webp|bmp|gif)/gi;
+const RELATIVE_IMAGE_PATH_REGEX = /(?:^|[\s(])((?:\.{1,2}[\\/])?(?:[^\\/\r\n"'<>|?*:\s]+[\\/])*[^\\/\r\n"'<>|?*:\s]+\.(?:png|jpe?g|webp|bmp|gif))(?=$|[\s),.;:\]}])/gi;
 const TRAILING_PATH_PUNCTUATION_REGEX = /[),.;:\]}]+$/;
 const FULL_ACCESS_STORAGE_PREFIX = "codex-stressced-full-access:";
 const REPEATED_ENV_ERROR_LIMIT = 3;
@@ -24,53 +30,10 @@ export type Thread = {
   status: "idle" | "busy" | "error";
   updatedAt: number;
   preview?: string;
+  cwd?: string;
 };
 
-export type Role = "user" | "assistant" | "system";
 
-export type Message = {
-  id: string;
-  role: Role;
-  content: string;
-  image?: string;
-  toolCalls?: ToolCall[];
-};
-
-export type ThinkingMessage = {
-  id: string;
-  content: string;
-  done?: boolean;
-};
-
-export type ToolCall = {
-  id: string;
-  name: string;
-  input: unknown;
-  status: "pending" | "approved" | "rejected";
-  approvalId?: string;
-  output?: string;
-};
-
-type ThreadReadItem = {
-  id?: string;
-  role?: string;
-  type?: string;
-  text?: unknown;
-  content?: unknown;
-};
-
-type ThreadReadResponse = {
-  thread?: {
-    path?: string | null;
-  };
-  items?: ThreadReadItem[];
-};
-
-type HistoryItem = {
-  id?: string;
-  role?: Role | "thinking";
-  content?: string;
-};
 
 type AppState = {
   threads: Thread[];
@@ -82,16 +45,30 @@ type AppState = {
   fullAccess: boolean;
   connectionStatus: ConnectionState;
   connectionError: string | null;
+  contextUsage: ContextUsage | null;
+  compacting: boolean;
+  historyTurns: ThreadTurn[];
+  historyCursor: string | null;
+  loadingHistory: boolean;
+  loadOlder: () => Promise<void>;
+  compact: () => Promise<void>;
 
   init: () => Promise<void>;
-  createThread: (model?: string | null) => Promise<void>;
+  createThread: (options?: CreateThreadOptions) => Promise<void>;
   switchThread: (id: string) => Promise<void>;
   sendMessage: (text: string, image?: string | null) => Promise<void>;
+  stopTurn: () => Promise<void>;
   approveToolCall: (toolCallId: string, approvalId?: string) => Promise<void>;
   rejectToolCall: (toolCallId: string, approvalId?: string) => Promise<void>;
   enableFullAccess: () => Promise<void>;
   disableFullAccess: () => Promise<void>;
   onNotification: (data: Record<string, unknown>) => void;
+};
+
+export type CreateThreadOptions = {
+  model?: string | null;
+  cwd?: string | null;
+  computerUse?: boolean;
 };
 
 let idCounter = 1;
@@ -129,26 +106,43 @@ function extractRpcError(err: unknown): string {
   return m || "Unknown error";
 }
 
-function extractLocalImagePaths(text: string): string[] {
-  const paths: string[] = [];
+export function extractLocalImagePaths(text: string): string[] {
+  const matches: { path: string; start: number; end: number }[] = [];
   const seen = new Set<string>();
 
-  for (const match of text.matchAll(LOCAL_IMAGE_PATH_REGEX)) {
-    const path = match[0].replace(TRAILING_PATH_PUNCTUATION_REGEX, "");
-    const key = path.toLowerCase();
+  const addMatch = (path: string, start: number, end: number) => {
+    const normalizedPath = path.replace(TRAILING_PATH_PUNCTUATION_REGEX, "");
+    const normalizedEnd = end - (path.length - normalizedPath.length);
+    if (matches.some((entry) => start < entry.end && normalizedEnd > entry.start)) return;
+    const key = normalizedPath.toLowerCase();
     if (!seen.has(key)) {
       seen.add(key);
-      paths.push(path);
+      matches.push({ path: normalizedPath, start, end: normalizedEnd });
     }
+  };
+
+  for (const match of text.matchAll(QUOTED_IMAGE_PATH_REGEX)) {
+    const path = match[2];
+    const start = (match.index ?? 0) + match[0].indexOf(path);
+    addMatch(path, start, start + path.length);
+  }
+  for (const match of text.matchAll(ABSOLUTE_IMAGE_PATH_REGEX)) {
+    const start = match.index ?? 0;
+    addMatch(match[0], start, start + match[0].length);
+  }
+  for (const match of text.matchAll(RELATIVE_IMAGE_PATH_REGEX)) {
+    const path = match[1];
+    const start = (match.index ?? 0) + match[0].indexOf(path);
+    addMatch(path, start, start + path.length);
   }
 
-  return paths;
+  return matches.sort((a, b) => a.start - b.start).map((entry) => entry.path);
 }
 
-async function readLocalImageDataUrl(path: string): Promise<string | null> {
+async function readLocalImageDataUrl(path: string, cwd?: string): Promise<string | null> {
   try {
     const api = (window as any).CodexStressCed;
-    const dataUrl = await api?.readLocalImage?.(path);
+    const dataUrl = await api?.readLocalImage?.(path, cwd);
     return typeof dataUrl === "string" && dataUrl.startsWith("data:image/")
       ? dataUrl
       : null;
@@ -256,7 +250,7 @@ async function bestEffortInterruptTurn(threadId: string, turnId: string) {
 }
 
 function notificationItemId(params: Record<string, unknown> | undefined): string {
-  return stringValue(params?.itemId) || stringValue(params?.item_id);
+  return stringValue(params?.itemId) || stringValue(params?.item_id) || turnItemId(params?.item);
 }
 
 function notificationDelta(params: Record<string, unknown> | undefined): string {
@@ -365,13 +359,18 @@ export const useStore = create<AppState>((set, get) => ({
   fullAccess: false,
   connectionStatus: "connecting",
   connectionError: null,
+  contextUsage: null,
+  compacting: false,
+  historyTurns: [],
+  historyCursor: null,
+  loadingHistory: false,
 
   init: async () => {
     onConnectionStatus((status, message) => {
       set({
         connectionStatus: status,
         connectionError: status === "error" ? (message ?? null) : null,
-        ...(status === "error" ? { isStreaming: false, streaming: null } : {}),
+        ...(status === "error" || status === "closed" ? { isStreaming: false, streaming: null, compacting: false } : {}),
       });
     });
 
@@ -395,7 +394,7 @@ export const useStore = create<AppState>((set, get) => ({
 
     try {
       console.log("[store] RPC thread/list");
-      type ThreadListRaw = { id: string; name?: string | null; preview?: string | null; model_provider?: string; status?: { type: string } | string; updated_at?: number };
+      type ThreadListRaw = { id: string; name?: string | null; preview?: string | null; modelProvider?: string; cwd?: string; status?: { type: string }; updatedAt?: number };
       const res = await rpc<{ data: ThreadListRaw[] }>("thread/list", {
         limit: 50,
         sortDirection: "desc",
@@ -407,9 +406,10 @@ export const useStore = create<AppState>((set, get) => ({
           id: t.id,
           name: (label ?? "Chat").toString(),
           preview: t.preview || undefined,
-          model: t.model_provider || null,
-          status: "idle",
-          updatedAt: t.updated_at || Date.now(),
+          model: t.modelProvider || null,
+          cwd: t.cwd || undefined,
+          status: t.status?.type === "active" ? "busy" : t.status?.type === "systemError" ? "error" : "idle",
+          updatedAt: t.updatedAt ? t.updatedAt * 1000 : Date.now(),
         };
       });
       set({ threads });
@@ -419,7 +419,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  createThread: async (model) => {
+  createThread: async (options = {}) => {
     const status = get().connectionStatus;
     if (status !== "connected") {
       console.warn("[store] createThread: not connected, status:", status);
@@ -429,14 +429,23 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Try app-server first; on failure, create a local thread.
+    const version = ++historyRequestVersion;
+    set({ loadingHistory: false });
     try {
-      console.log("[store] RPC thread/start", { model });
+      const { model, cwd, computerUse = false } = options;
+      console.log("[store] RPC thread/start", { model, cwd, computerUse });
       const res = await rpc<{ thread: Thread }>("thread/start", {
         model: model ?? undefined,
+        cwd: cwd?.trim() || undefined,
+        dynamicTools: computerUse ? [COMPUTER_TOOL_SPEC] : undefined,
       });
       console.log("[store] RPC thread/start response", res);
-      const thread = res.thread;
+      const thread = {
+        ...res.thread,
+        cwd: res.thread.cwd || cwd?.trim() || undefined,
+      };
+      if (version !== historyRequestVersion) return;
+      resetToolProgress();
       console.log("[store] createThread: setting threadId:", thread.id);
       writeStoredFullAccess(thread.id, false);
       set((s) => ({
@@ -445,169 +454,105 @@ export const useStore = create<AppState>((set, get) => ({
         messages: [],
         thinkingMessages: [],
         fullAccess: false,
+        streaming: null, isStreaming: false, compacting: false, contextUsage: null,
+        historyTurns: [], historyCursor: null, loadingHistory: false,
       }));
       console.log("[store] createThread: done, currentThreadId set to", thread.id);
       return;
     } catch (err) {
-      console.error("[store] thread/start failed; creating local thread", err);
+      if (version === historyRequestVersion) set({ connectionError: extractRpcError(err) });
     }
-
-    const thread: Thread = {
-      id: nextId(),
-      name: nextChatName(),
-      model: model ?? null,
-      status: "idle",
-      updatedAt: Date.now(),
-    };
-    writeStoredFullAccess(thread.id, false);
-    set((s) => ({
-      threads: [thread, ...s.threads],
-      currentThreadId: thread.id,
-      messages: [],
-      thinkingMessages: [],
-      fullAccess: false,
-    }));
   },
 
   switchThread: async (id) => {
-    console.log("[store] switchThread START", id);
-    const { threads, currentThreadId } = get();
-
-    // If thread not in list, just select it with empty messages.
-    const exists = threads.some((t) => t.id === id);
+    if (get().currentThreadId === id && (get().isStreaming || get().loadingHistory)) return;
+    const version = ++historyRequestVersion;
     const storedFullAccess = readStoredFullAccess(id);
-    if (!exists) {
-      console.log("[store] switchThread: thread not in list, selecting empty", id);
-      set({ currentThreadId: id, messages: [], thinkingMessages: [], fullAccess: storedFullAccess });
-      if (storedFullAccess) {
-        applyAccessSettings(id, true).catch((err) => {
-          console.error("[store] switchThread apply full access failed:", err);
-        });
-      }
-      return;
-    }
-
-    // If already on this thread and streaming, do not reload.
-    if (currentThreadId === id && get().isStreaming) {
-      console.log("[store] switchThread: same thread + streaming, skip");
-      return;
-    }
-
-    // Select the thread and clear messages.
     resetToolProgress();
-    set({
-      currentThreadId: id,
-      messages: [],
-      thinkingMessages: [],
-      isStreaming: false,
-      streaming: null,
-      fullAccess: storedFullAccess,
-    });
-
-    let messages: Message[] = [];
-    let thinkingMessages: ThinkingMessage[] = [];
-    let threadInfo: { path?: string } | null = null;
-
-    // First attempt: thread/resume + thread/read via RPC.
+    set({ currentThreadId: id, messages: [], thinkingMessages: [], streaming: null,
+      isStreaming: false, compacting: false, contextUsage: null,
+      historyTurns: [], historyCursor: null, loadingHistory: true,
+      fullAccess: storedFullAccess, connectionError: null });
     try {
-      console.log("[store] RPC thread/resume", id);
-      await rpc("thread/resume", { threadId: id });
-      console.log("[store] RPC thread/resume OK");
-
-      if (storedFullAccess) {
-        console.log("[store] RPC thread/settings/update full access after resume", id);
-        await applyAccessSettings(id, true);
-        console.log("[store] RPC thread/settings/update full access OK");
+      const resumed = await rpc<{ thread: { status?: { type?: string }; cwd?: string } }>("thread/resume", { threadId: id, excludeTurns: true });
+      if (version !== historyRequestVersion) return;
+      if (resumed.thread.cwd) {
+        set((state) => ({
+          threads: state.threads.map((thread) => thread.id === id ? { ...thread, cwd: resumed.thread.cwd } : thread),
+        }));
       }
-
-      console.log("[store] RPC thread/read", id);
-      const res = await rpc<ThreadReadResponse>("thread/read", { threadId: id });
-      console.log("[store] RPC thread/read OK keys", Object.keys(res ?? {}));
-
-      // Capture thread path for fallback.
-      if (res && res.thread && res.thread.path) {
-        threadInfo = { path: res.thread.path };
-      }
-
-      const items = Array.isArray(res?.items) ? res.items : [];
-      console.log("[store] switchThread: items count", items.length);
-
-      if (items.length > 0) {
-        // Use RPC items.
-        for (const it of items) {
-          const role = it.role;
-          const type = it.type;
-          if (type === "userMessage" || role === "user") {
-            const content = textFromContentParts(it.content ?? [], false);
-            if (content.trim() && !isInternalHistoryMessageContent(content)) {
-              messages.push({ id: it.id || "msg-" + messages.length, role: "user", content });
-            }
-          } else if (type === "agentMessage" || role === "assistant") {
-            const content = stringValue(it.text) || textFromContentParts(it.content ?? [], true);
-            if (content.trim() && !isInternalHistoryMessageContent(content)) {
-              messages.push({ id: it.id || "msg-" + messages.length, role: "assistant", content });
-            }
-          } else if (type === "reasoning") {
-            const content = thinkingTextFromItem(it);
-            if (content) {
-              thinkingMessages.push({ id: it.id || "thinking-" + thinkingMessages.length, content, done: true });
-            }
-          }
-        }
-      }
-    } catch (rpcErr) {
-      console.error("[store] RPC thread/load FAILED for", id, rpcErr);
-    }
-
-    // Fallback: if no messages from RPC, try reading the JSONL history file.
-    if (threadInfo?.path) {
+      if (resumed.thread.status?.type === "active") set({ isStreaming: true });
+      if (storedFullAccess) await applyAccessSettings(id, true);
+      let turns: ThreadTurn[];
+      let cursor: string | null = null;
       try {
-        console.log("[store] switchThread: using JSONL fallback", threadInfo.path);
-        const api = (window as any).CodexStressCed;
-        const history = await api?.readThreadHistory?.(threadInfo.path) as HistoryItem[] | undefined;
-        if (Array.isArray(history) && history.length > 0) {
-          console.log("[store] switchThread: JSONL history messages count", history.length);
-          const historyMessages: Message[] = [];
-          const historyThinkingMessages: ThinkingMessage[] = [];
-          for (const h of history) {
-            const content = stringValue(h.content);
-            if (
-              (h.role === "user" || h.role === "assistant") &&
-              content &&
-              !isInternalHistoryMessageContent(content)
-            ) {
-              historyMessages.push({
-                id: h.id || "hist-msg-" + historyMessages.length,
-                role: h.role,
-                content,
-              });
-            } else if (h.role === "thinking" && content && !isInternalHistoryMessageContent(content)) {
-              historyThinkingMessages.push({
-                id: h.id || "hist-thinking-" + historyThinkingMessages.length,
-                content,
-                done: true,
-              });
-            }
-          }
-          if (historyMessages.length > messages.length) {
-            messages = historyMessages;
-          }
-          if (historyThinkingMessages.length > thinkingMessages.length) {
-            thinkingMessages = historyThinkingMessages;
-          }
-        }
-      } catch (histErr) {
-        console.error("[store] JSONL read failed", histErr);
+        const page = await rpc<TurnsPage>("thread/turns/list", {
+          threadId: id, limit: 30, sortDirection: "desc", itemsView: "full",
+        });
+        turns = [...page.data].reverse();
+        cursor = page.nextCursor;
+      } catch (error) {
+        // Older backends may lack pagination; retain the public protocol as the source of truth.
+        const message = extractRpcError(error);
+        if (!/unsupported|not supported|not found|unknown method|-32601|experimental/i.test(message)) throw error;
+        const response = await rpc<ThreadReadResponse>("thread/read", { threadId: id, includeTurns: true });
+        turns = response.thread.turns ?? [];
       }
+      if (version !== historyRequestVersion || get().currentThreadId !== id) return;
+      const transcript = transcriptFromTurns(turns);
+      set(state => ({
+        messages: [...transcript.messages.filter(m => !state.messages.some(x => x.id === m.id)), ...state.messages],
+        thinkingMessages: [...transcript.thinkingMessages.filter(m => !state.thinkingMessages.some(x => x.id === m.id)), ...state.thinkingMessages],
+        historyTurns: turns, historyCursor: cursor,
+      }));
+    } catch (error) {
+      if (version === historyRequestVersion) set({ connectionError: extractRpcError(error) });
+    } finally {
+      if (version === historyRequestVersion) set({ loadingHistory: false });
     }
+  },
 
-    console.log("[store] switchThread: setting messages count", messages.length, "thinking count", thinkingMessages.length);
-    set({ messages, thinkingMessages });
+  loadOlder: async () => {
+    const { currentThreadId: id, historyCursor: cursor, loadingHistory, isStreaming } = get();
+    if (!id || !cursor || loadingHistory || isStreaming) return;
+    const version = historyRequestVersion;
+    set({ loadingHistory: true });
+    try {
+      const page = await rpc<TurnsPage>("thread/turns/list", {
+        threadId: id, cursor, limit: 30, sortDirection: "desc", itemsView: "full",
+      });
+      if (version !== historyRequestVersion || get().currentThreadId !== id) return;
+      const older = [...page.data].reverse();
+      const historyTurns = prependTurns(older, get().historyTurns);
+      const transcript = transcriptFromTurns(older);
+      // Preserve newer live messages that are not part of the loaded history pages.
+      set((state) => ({
+        messages: [...transcript.messages.filter(m => !state.messages.some(x => x.id === m.id)), ...state.messages],
+        thinkingMessages: [...transcript.thinkingMessages.filter(m => !state.thinkingMessages.some(x => x.id === m.id)), ...state.thinkingMessages],
+        historyTurns, historyCursor: page.nextCursor,
+      }));
+    } catch (error) {
+      if (version === historyRequestVersion) set({ connectionError: extractRpcError(error) });
+    } finally {
+      if (version === historyRequestVersion) set({ loadingHistory: false });
+    }
+  },
+
+  compact: async () => {
+    const { currentThreadId: id, compacting, isStreaming, loadingHistory } = get();
+    if (!id || compacting || isStreaming || loadingHistory) return;
+    set({ compacting: true, connectionError: null });
+    try {
+      await rpc("thread/compact/start", { threadId: id });
+    } catch (error) {
+      if (get().currentThreadId === id) set({ compacting: false, connectionError: extractRpcError(error) });
+    }
   },
 
   sendMessage: async (text, image) => {
+    if (get().compacting || get().loadingHistory) return;
     console.log("[store] sendMessage called with text:", text);
-    const { currentThreadId, connectionStatus, fullAccess, isStreaming } = get();
+    const { currentThreadId, connectionStatus, fullAccess, isStreaming, threads } = get();
     console.log("[store] sendMessage state:", { currentThreadId, connectionStatus });
     if (!currentThreadId) {
       console.log("[store] sendMessage: no currentThreadId, returning");
@@ -622,6 +567,7 @@ export const useStore = create<AppState>((set, get) => ({
       }));
       return;
     }
+    const activeCwd = threads.find((thread) => thread.id === currentThreadId)?.cwd;
 
     const activeTurnId = toolProgress.turnId;
     if (isStreaming && activeTurnId) {
@@ -663,7 +609,7 @@ export const useStore = create<AppState>((set, get) => ({
 
       for (const path of textImagePaths) {
         includedLocalImages.add(path.toLowerCase());
-        const dataUrl = await readLocalImageDataUrl(path);
+        const dataUrl = await readLocalImageDataUrl(path, activeCwd);
         if (dataUrl) {
           inputParts.push({ type: "image", url: dataUrl, detail: "high" });
           embeddedLocalImageCount += 1;
@@ -679,7 +625,7 @@ export const useStore = create<AppState>((set, get) => ({
         } else {
           const imageKey = image.toLowerCase();
           if (!includedLocalImages.has(imageKey)) {
-            const dataUrl = await readLocalImageDataUrl(image);
+            const dataUrl = await readLocalImageDataUrl(image, activeCwd);
             if (dataUrl) {
               inputParts.push({ type: "image", url: dataUrl, detail: "high" });
               embeddedLocalImageCount += 1;
@@ -715,6 +661,19 @@ export const useStore = create<AppState>((set, get) => ({
         streaming: null,
         connectionError: msg || "Error sending message",
       });
+    }
+  },
+
+  stopTurn: async () => {
+    const { currentThreadId, isStreaming } = get();
+    const turnId = toolProgress.turnId;
+    if (!currentThreadId || !isStreaming || !turnId) return;
+
+    try {
+      await rpc("turn/interrupt", { threadId: currentThreadId, turnId });
+    } catch (err) {
+      console.error("[store] stopTurn failed:", err);
+      set({ connectionError: extractRpcError(err) });
     }
   },
 
@@ -805,6 +764,27 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
+    // Every live turn event belongs to a thread, including child-agent output.
+    const eventThreadId = notificationThreadId(params);
+    if (eventThreadId && eventThreadId !== get().currentThreadId) return;
+    if (method === "thread/tokenUsage/updated") {
+      const usage = params?.tokenUsage as { last?: { totalTokens?: number }; modelContextWindow?: number | null } | undefined;
+      const used = usage?.last?.totalTokens;
+      if (typeof used === "number") set({ contextUsage: { used, window: usage?.modelContextWindow ?? null } });
+      return;
+    }
+    if (method === "turn/started") {
+      const turn = params?.turn as { id?: string } | undefined;
+      if (turn?.id) resetToolProgress(turn.id);
+      set({ isStreaming: true });
+      return;
+    }
+    if (method === "error") {
+      const error = params?.error as { message?: string } | undefined;
+      if (params?.willRetry !== true) set({ compacting: false, isStreaming: false, connectionError: error?.message ?? "Error del servidor" });
+      return;
+    }
+
     // Streaming text deltas: item/agentMessage/delta
     // AgentMessageDeltaNotification: { thread_id, turn_id, item_id, delta }
     if (method === "item/agentMessage/delta") {
@@ -813,23 +793,13 @@ export const useStore = create<AppState>((set, get) => ({
       if (!text) return;
 
       toolProgress.visibleAssistant = true;
+      const id = notificationItemId(params) || "stream-assistant";
       set((s) => {
-        const next = (s.streaming ?? "") + text;
-        const msgs = s.messages.slice();
-
-        const last = msgs[msgs.length - 1];
-        if (last && last.role === "assistant" && s.isStreaming) {
-          // Update last assistant message immutably
-          msgs[msgs.length - 1] = { ...last, content: next };
-        } else {
-          msgs.push({
-            id: "stream-assistant",
-            role: "assistant",
-            content: next,
-          });
-        }
-
-        return { streaming: next, messages: msgs };
+        const existing = s.messages.find(m => m.id === id);
+        const content = (existing?.content ?? "") + text;
+        const message: Message = { id, role: "assistant", content };
+        const messages = existing ? s.messages.map(m => m.id === id ? message : m) : [...s.messages, message];
+        return { streaming: content, messages };
       });
       return;
     }
@@ -856,6 +826,7 @@ export const useStore = create<AppState>((set, get) => ({
 
       const item = params?.item;
       const type = itemType(item);
+      if (type === "contextCompaction") { set({ compacting: true }); return; }
       if (!type || type === "reasoning" || type === "agentMessage" || type === "userMessage") return;
 
       toolProgress.started += 1;
@@ -869,13 +840,26 @@ export const useStore = create<AppState>((set, get) => ({
       const turnId = notificationTurnId(params);
       const item = params?.item;
       const type = itemType(item);
+      if (type === "contextCompaction") {
+        const id = notificationItemId(params) || `compact-${turnId}`;
+        set((s) => ({ compacting: false, messages: s.messages.some(m => m.id === id) ? s.messages : [...s.messages, { id, role: "system", kind: "compaction", content: "Contexto compactado" }] }));
+        return;
+      }
       if (type === "reasoning") {
         set((s) => ({
           thinkingMessages: upsertCompletedThinkingItem(s.thinkingMessages, item),
         }));
         return;
       }
-      if (!type || type === "agentMessage" || type === "userMessage") return;
+      if (type === "agentMessage") {
+        const completed = transcriptFromTurns([{ id: turnId, items: [item as Record<string, unknown>] }]).messages[0];
+        if (completed) set(s => ({ streaming: null, messages: upsertCompletedMessage(s.messages, completed) }));
+        return;
+      }
+      if (!type || type === "userMessage") return;
+
+      const completed = transcriptFromTurns([{ id: turnId, items: [item as Record<string, unknown>] }]).messages[0];
+      if (completed) set(s => ({ messages: upsertCompletedMessage(s.messages, completed) }));
 
       toolProgress.completed += 1;
       const status = itemStatus(item);
@@ -914,7 +898,7 @@ export const useStore = create<AppState>((set, get) => ({
       const turn = params?.turn as { status?: string; error?: { message?: string } } | undefined;
       const errorMessage = turn?.status === "failed" ? turn.error?.message : undefined;
       set((s) => {
-        if (!s.isStreaming && s.streaming == null && !errorMessage) return s;
+        if (!s.isStreaming && s.streaming == null && !s.compacting && !errorMessage) return s;
         const assistantId = "id-" + Date.now();
         let msgs = s.messages.map((m) => {
           if (m.id === "stream-assistant" && m.role === "assistant") {
@@ -928,6 +912,7 @@ export const useStore = create<AppState>((set, get) => ({
           streaming: null,
           messages: msgs,
           connectionError: errorMessage ?? s.connectionError,
+          compacting: false,
         };
       });
       return;

@@ -212,6 +212,21 @@ impl UnifiedExecProcess {
         }
     }
 
+    /// Stop a pipe-backed Windows process while retaining its final output.
+    #[cfg(windows)]
+    pub(super) async fn interrupt_pipe(&self) -> Result<(), UnifiedExecError> {
+        match &self.process_handle {
+            ProcessHandle::Local(process_handle) => {
+                process_handle.request_terminate();
+                Ok(())
+            }
+            ProcessHandle::ExecServer(process_handle) => process_handle
+                .terminate()
+                .await
+                .map_err(|err| UnifiedExecError::process_failed(err.to_string())),
+        }
+    }
+
     pub(super) fn fail_and_terminate(&self, message: String) {
         let state = self.state_rx.borrow().clone();
         if state.failure_message.is_none() {

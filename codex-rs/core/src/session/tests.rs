@@ -4636,6 +4636,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         agent_status: agent_status_tx,
         out_of_band_elicitation_paused: watch::channel(false).0,
         state: Mutex::new(state),
+        settings_persistence_lock: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -6471,6 +6472,7 @@ where
         agent_status: agent_status_tx,
         out_of_band_elicitation_paused: watch::channel(false).0,
         state: Mutex::new(state),
+        settings_persistence_lock: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -10282,3 +10284,6 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 
     Ok(())
 }
+
+#[path = "thread_settings_tests.rs"]
+mod thread_settings_tests;

@@ -24,6 +24,13 @@ use tracing::info;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// Whether a provider extends the bundled OpenAI catalog or owns its complete catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCatalogMode {
+    MergeBundled,
+    RemoteOnly,
+}
+
 /// Remote endpoint used by the OpenAI-compatible model manager.
 ///
 /// Implementations own provider-specific auth and transport details. The model
@@ -31,6 +38,11 @@ const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 /// this endpoint only when it decides a remote refresh should happen.
 #[async_trait]
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
+    /// Local providers use `RemoteOnly` so OpenAI models are never advertised.
+    fn catalog_mode(&self) -> ModelCatalogMode {
+        ModelCatalogMode::MergeBundled
+    }
+
     /// Returns whether this provider can authenticate command-scoped requests.
     fn has_command_auth(&self) -> bool;
 
@@ -203,7 +215,10 @@ impl OpenAiModelsManager {
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
-        let remote_models = load_remote_models_from_file().unwrap_or_default();
+        let remote_models = match endpoint_client.catalog_mode() {
+            ModelCatalogMode::MergeBundled => load_remote_models_from_file().unwrap_or_default(),
+            ModelCatalogMode::RemoteOnly => Vec::new(),
+        };
         Self {
             remote_models: RwLock::new(remote_models),
             etag: RwLock::new(None),
@@ -321,6 +336,10 @@ impl OpenAiModelsManager {
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
+        if self.endpoint_client.catalog_mode() == ModelCatalogMode::RemoteOnly {
+            *self.remote_models.write().await = models;
+            return;
+        }
         // Use the remote models list as the source of truth if it contains at least one
         // non-hidden model and the user is using ChatGPT auth.
         let should_use_remote_models_only = !models.is_empty()

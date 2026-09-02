@@ -202,6 +202,7 @@ mod review;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
+mod thread_settings;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 use self::config_lock::export_config_lock_if_configured;
@@ -2625,18 +2626,22 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         compacted_item: CompactedItem,
     ) {
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
         {
             let mut state = self.state.lock().await;
             state.replace_history(items, reference_context_item.clone());
             state.start_next_auto_compact_window();
         }
 
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
+        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
         if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
         }
+        // A frozen turn context may predate an accepted cwd/settings update.
+        rollout_items.push(RolloutItem::EventMsg(
+            thread_settings::applied_event(self).await,
+        ));
+        self.persist_rollout_items(&rollout_items).await;
         {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);

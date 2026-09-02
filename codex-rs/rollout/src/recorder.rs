@@ -49,6 +49,7 @@ use crate::state_db;
 use crate::state_db::StateDbHandle;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ResumedHistory;
@@ -1422,14 +1423,30 @@ impl RolloutWriterState {
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
-        if self.is_deferred() && self.pending_items.is_empty() {
+        // Settings alone must not create an empty conversation. Keep them buffered
+        // until a real turn or an explicit persist materializes the rollout.
+        if self.is_deferred()
+            && self.pending_items.iter().all(|item| {
+                matches!(
+                    item,
+                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+                )
+            })
+        {
             return Ok(());
         }
         self.write_pending_with_recovery("flush").await
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        if self.is_deferred() && self.pending_items.is_empty() {
+        if self.is_deferred()
+            && self.pending_items.iter().all(|item| {
+                matches!(
+                    item,
+                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+                )
+            })
+        {
             return Ok(());
         }
         self.write_pending_with_recovery("shutdown").await

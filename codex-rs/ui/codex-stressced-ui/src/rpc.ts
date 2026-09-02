@@ -11,8 +11,9 @@ declare global {
     CodexStressCed: {
       rpc: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
       openImageDialog: () => Promise<string | null>;
+      openWorkspaceDialog: () => Promise<string | null>;
       getPastedImage: () => Promise<string | null>;
-      readLocalImage?: (filePath: string) => Promise<string | null>;
+      readLocalImage?: (filePath: string, cwd?: string) => Promise<string | null>;
       readThreadHistory?: (filePath: string) => Promise<Array<Record<string, unknown>>>;
       onNotification: (fn: NotifyListener) => () => void;
       onConnectionStatus: (fn: ConnectionStatusListener) => () => void;

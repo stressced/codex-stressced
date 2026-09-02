@@ -214,6 +214,12 @@ fn command_usage_block_reason(command: &str) -> Option<String> {
         );
     }
 
+    if !has_powershell_here_string && tokens_contain_command(&tokens, |token| token == "tail") {
+        issues.push(
+            "- Unix `tail` is not available in this PowerShell workspace. Use `... | Select-Object -Last N` instead.",
+        );
+    }
+
     if !has_powershell_here_string && get_content_tokens_contain(&tokens, |token| token == "-skip")
     {
         issues.push(
@@ -662,7 +668,9 @@ fn existing_source_write_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
             Default::default()
         })
     {
-        if matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file()) {
+        if matches!(fs::metadata(&path), Ok(metadata) if metadata.is_file())
+            && !is_root_scratch_artifact_path(&path, cwd)
+        {
             targets.insert(normalize_existing_path(path));
         }
     }
@@ -853,7 +861,7 @@ fn is_root_scratch_artifact_path(path: &Path, cwd: &Path) -> bool {
         || (lower.starts_with("temp_")
             && matches!(
                 Path::new(&lower).extension().and_then(|ext| ext.to_str()),
-                Some("diff" | "patch" | "py" | "txt")
+                Some("cjs" | "diff" | "js" | "mjs" | "patch" | "py" | "txt")
             ))
         || matches!(lower.as_str(), "test_all.xml" | "test_junit.xml")
         || (lower.ends_with(".xml")
@@ -1030,6 +1038,11 @@ fn script_write_source_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    for (variable, path) in assigned_pathlib_source_paths(command, cwd) {
+        if variable_path_object_is_written(command, &variable) {
+            targets.insert(normalize_existing_path(path));
+        }
+    }
     for (variable, path) in assigned_source_paths(command, cwd) {
         if variable_is_opened_for_writing(command, &variable)
             || variable_is_pathlib_written(command, &variable)
@@ -1066,6 +1079,25 @@ fn assigned_source_paths(command: &str, cwd: &Path) -> Vec<(String, PathBuf)> {
     assignments
 }
 
+fn assigned_pathlib_source_paths(command: &str, cwd: &Path) -> Vec<(String, PathBuf)> {
+    let mut assignments = Vec::new();
+    if let Ok(assignment) = Regex::new(
+        r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:Path|pathlib\.Path)\(\s*[rRuUbBfF]*['"]([^'"\r\n]+)['"]\s*\)"#,
+    ) {
+        for captures in assignment.captures_iter(command) {
+            let Some(variable) = captures.get(1).map(|match_| match_.as_str().to_string()) else {
+                continue;
+            };
+            let Some(path) = candidate_path(captures.get(2).map(|match_| match_.as_str()), cwd)
+            else {
+                continue;
+            };
+            assignments.push((variable, path));
+        }
+    }
+    assignments
+}
+
 fn variable_is_opened_for_writing(command: &str, variable: &str) -> bool {
     let pattern = format!(
         r#"open\(\s*{}\s*,\s*[rRuUbBfF]*['"][^'"\r\n]*[wa][^'"\r\n]*['"]"#,
@@ -1079,6 +1111,11 @@ fn variable_is_pathlib_written(command: &str, variable: &str) -> bool {
         r#"(?:Path|pathlib\.Path)\(\s*{}\s*\)\.write_(?:text|bytes)\s*\("#,
         variable
     );
+    Regex::new(&pattern).is_ok_and(|pathlib_write| pathlib_write.is_match(command))
+}
+
+fn variable_path_object_is_written(command: &str, variable: &str) -> bool {
+    let pattern = format!(r#"\b{}\s*\.write_(?:text|bytes)\s*\("#, variable);
     Regex::new(&pattern).is_ok_and(|pathlib_write| pathlib_write.is_match(command))
 }
 
@@ -1496,6 +1533,20 @@ new content
     }
 
     #[test]
+    fn blocks_unix_tail_with_powershell_hint() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"dotnet build D:\stutterino\GameStutterLab.sln 2>&1 | tail -5"#,
+            temp.path(),
+        )
+        .expect("block reason");
+
+        assert!(reason.contains("Unix `tail`"));
+        assert!(reason.contains("Select-Object -Last N"));
+    }
+
+    #[test]
     fn blocks_rg_rn_with_line_number_hint() {
         let temp = tempdir().expect("tempdir");
 
@@ -1865,6 +1916,15 @@ auto shifted = value << 1;
         let temp = tempdir().expect("tempdir");
 
         let reason = StresscedEditGuard::block_reason(r#"Write-Output "head""#, temp.path());
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_write_output_exact_tail_literal() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(r#"Write-Output "tail""#, temp.path());
 
         assert_eq!(reason, None);
     }
@@ -2311,6 +2371,54 @@ Path(target).write_text('int new_value = 1;\n')
     }
 
     #[test]
+    fn blocks_path_object_write_text_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let source = cwd.join("Program.cs");
+        fs::write(&source, "class Program {}\n").expect("write source");
+        let command = r#"@'
+from pathlib import Path
+p = Path(r"Program.cs")
+lines = p.read_text("utf-8").splitlines(True)
+result = "".join(lines[:1]) + "class Replacement {}\n"
+p.write_text(result, "utf-8")
+'@ | python -"#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("Python direct source write"));
+        assert!(reason.contains(&normalize_existing_path(source).display().to_string()));
+    }
+
+    #[test]
+    fn allows_path_object_read_text_of_existing_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("Program.cs"), "class Program {}\n").expect("write source");
+        let command = r#"@'
+from pathlib import Path
+p = Path(r"Program.cs")
+print(p.read_text("utf-8"))
+'@ | python -"#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_quoted_tail_text_that_is_not_a_command() {
+        let temp = tempdir().expect("tempdir");
+
+        let reason = StresscedEditGuard::block_reason(
+            r#"Write-Output "Use rg -n pattern path | tail -20 only in Bash docs""#,
+            temp.path(),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
     fn blocks_python_rewrite_of_existing_markdown_file() {
         let temp = tempdir().expect("tempdir");
         let cwd = temp.path();
@@ -2408,6 +2516,54 @@ print(open(path, 'r', encoding='utf-8').read())
         let reason = StresscedEditGuard::block_reason(command, cwd);
 
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_python_write_to_new_root_temp_javascript_scratch_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let command = r#"python -c "open(r'temp_check.js', 'w').write('console.log(1);\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn allows_python_rewrite_of_existing_root_temp_javascript_scratch_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("temp_check.js"), "console.log(0);\n").expect("write scratch");
+        let command = r#"python -c "open(r'temp_check.js', 'w').write('console.log(1);\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd);
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn blocks_python_write_to_nested_temp_javascript_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("src")).expect("create src");
+        let command = r#"python -c "open(r'src\temp_check.js', 'w').write('console.log(1);\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("refused Python as the direct writer"));
+        assert!(reason.contains(&cwd.join("src").join("temp_check.js").display().to_string()));
+    }
+
+    #[test]
+    fn blocks_python_write_to_non_temp_root_javascript_source_file() {
+        let temp = tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let command = r#"python -c "open(r'check.js', 'w').write('console.log(1);\n')""#;
+
+        let reason = StresscedEditGuard::block_reason(command, cwd).expect("block reason");
+
+        assert!(reason.contains("refused Python as the direct writer"));
+        assert!(reason.contains(&cwd.join("check.js").display().to_string()));
     }
 
     #[test]

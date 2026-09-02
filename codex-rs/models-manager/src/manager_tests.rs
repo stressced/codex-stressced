@@ -72,6 +72,7 @@ fn assert_models_contain(actual: &[ModelInfo], expected: &[ModelInfo]) {
 
 #[derive(Debug)]
 struct TestModelsEndpoint {
+    catalog_mode: ModelCatalogMode,
     has_command_auth: bool,
     uses_codex_backend: bool,
     responses: Mutex<VecDeque<Vec<ModelInfo>>>,
@@ -81,6 +82,7 @@ struct TestModelsEndpoint {
 impl TestModelsEndpoint {
     fn new(responses: Vec<Vec<ModelInfo>>) -> Arc<Self> {
         Arc::new(Self {
+            catalog_mode: ModelCatalogMode::MergeBundled,
             has_command_auth: false,
             uses_codex_backend: true,
             responses: Mutex::new(responses.into()),
@@ -90,6 +92,7 @@ impl TestModelsEndpoint {
 
     fn without_refresh(responses: Vec<Vec<ModelInfo>>) -> Arc<Self> {
         Arc::new(Self {
+            catalog_mode: ModelCatalogMode::MergeBundled,
             has_command_auth: false,
             uses_codex_backend: false,
             responses: Mutex::new(responses.into()),
@@ -146,6 +149,10 @@ impl ExternalAuth for TestUnresolvedExternalApiKeyAuth {
 
 #[async_trait]
 impl ModelsEndpointClient for TestModelsEndpoint {
+    fn catalog_mode(&self) -> ModelCatalogMode {
+        self.catalog_mode
+    }
+
     fn has_command_auth(&self) -> bool {
         self.has_command_auth
     }
@@ -192,6 +199,39 @@ fn openai_manager_for_tests_with_auth(
 
 fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManager {
     StaticModelsManager::new(/*auth_manager*/ None, model_catalog)
+}
+
+#[tokio::test]
+async fn local_catalog_never_introduces_bundled_models() {
+    let temp = tempdir().unwrap();
+    let local_model = remote_model("local-qwen", "Local Qwen", /*priority*/ 0);
+    let endpoint = Arc::new(TestModelsEndpoint {
+        catalog_mode: ModelCatalogMode::RemoteOnly,
+        has_command_auth: true,
+        uses_codex_backend: false,
+        responses: Mutex::new(VecDeque::from([vec![local_model.clone()], vec![]])),
+        fetch_count: AtomicUsize::new(0),
+    });
+    let manager = openai_manager_for_tests_with_auth(
+        temp.path().to_path_buf(),
+        endpoint,
+        /*auth_manager*/ None,
+    );
+    assert_eq!(manager.get_remote_models().await, Vec::<ModelInfo>::new());
+    assert_eq!(
+        manager
+            .raw_model_catalog(RefreshStrategy::Online)
+            .await
+            .models,
+        vec![local_model]
+    );
+    assert_eq!(
+        manager
+            .raw_model_catalog(RefreshStrategy::Online)
+            .await
+            .models,
+        Vec::<ModelInfo>::new()
+    );
 }
 
 async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
@@ -496,6 +536,7 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
     )];
     let codex_home = tempdir().expect("temp dir");
     let endpoint = Arc::new(TestModelsEndpoint {
+        catalog_mode: ModelCatalogMode::MergeBundled,
         has_command_auth: true,
         uses_codex_backend: false,
         responses: Mutex::new(vec![remote_models.clone()].into()),

@@ -1,0 +1,12 @@
+filegroup(
+    name = "snapshot_sources",
+    srcs = [
+        "src/ContextStatus.tsx",
+        "src/ToolStatus.tsx",
+        "src/WorkspaceControls.tsx",
+        "src/history.ts",
+        "test/bundle.mjs",
+        "test/snapshots.mjs",
+    ],
+    visibility = ["//codex-rs/cli:__pkg__"],
+)

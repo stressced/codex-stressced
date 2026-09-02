@@ -38,12 +38,16 @@ contextBridge.exposeInMainWorld("CodexStressCed", {
     return ipcRenderer.invoke("open-image-dialog");
   },
 
+  openWorkspaceDialog: async () => {
+    return ipcRenderer.invoke("open-workspace-dialog");
+  },
+
   getPastedImage: async () => {
     return ipcRenderer.invoke("get-pasted-image");
   },
 
-  readLocalImage: async (filePath: string) => {
-    return ipcRenderer.invoke("read-local-image", filePath);
+  readLocalImage: async (filePath: string, cwd?: string) => {
+    return ipcRenderer.invoke("read-local-image", filePath, cwd);
   },
 
   onNotification: (cb: (data: Record<string, unknown>) => void) => {

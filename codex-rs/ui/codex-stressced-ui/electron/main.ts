@@ -3,6 +3,8 @@ import { app, BrowserWindow, clipboard, ipcMain, shell, dialog, nativeImage } fr
 import path from "path";
 import { spawn } from "child_process";
 import fs from "fs";
+import { executeComputerTool } from "./computer-use";
+import { localImageToDataUrl } from "./image-attachment";
 
 const LOG_FILE = path.join(
   process.env.USERPROFILE || process.env.HOME || "",
@@ -43,10 +45,6 @@ let activeWsPort: number | null = null;
 const LLAMA_CPP_URL = "http://127.0.0.1:8080/v1";
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const LONG_RPC_TIMEOUT_MS = 5 * 60_000;
-const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"]);
-const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024;
-const MAX_IMAGE_DIMENSION = 1200;
-const IMAGE_JPEG_QUALITY = 80;
 
 function rpcTimeoutMs(method: string): number {
   if (method === "turn/start" || method === "thread/read" || method === "thread/resume") {
@@ -62,41 +60,6 @@ function sendToRenderer(channel: string, ...args: unknown[]) {
   } catch {
     // ignore when shutting down
   }
-}
-
-function localImageToDataUrl(filePath: string): string | null {
-  const p = String(filePath || "").trim().replace(/^["']|["']$/g, "");
-  const ext = path.extname(p).toLowerCase();
-  if (!IMAGE_EXTENSIONS.has(ext)) return null;
-  if (!fs.existsSync(p)) return null;
-
-  const stat = fs.statSync(p);
-  if (!stat.isFile() || stat.size > MAX_IMAGE_FILE_BYTES) return null;
-
-  const image = nativeImage.createFromPath(p);
-  if (!image.isEmpty()) {
-    const size = image.getSize();
-    const maxSide = Math.max(size.width, size.height);
-    const resized = maxSide > MAX_IMAGE_DIMENSION
-      ? image.resize({
-          width: Math.round(size.width * (MAX_IMAGE_DIMENSION / maxSide)),
-          height: Math.round(size.height * (MAX_IMAGE_DIMENSION / maxSide)),
-          quality: "best",
-        })
-      : image;
-    return "data:image/jpeg;base64," + resized.toJPEG(IMAGE_JPEG_QUALITY).toString("base64");
-  }
-
-  const mime = ext === ".jpg" || ext === ".jpeg"
-    ? "image/jpeg"
-    : ext === ".webp"
-      ? "image/webp"
-      : ext === ".bmp"
-        ? "image/bmp"
-        : ext === ".gif"
-          ? "image/gif"
-          : "image/png";
-  return `data:${mime};base64,${fs.readFileSync(p).toString("base64")}`;
 }
 
 function logMain(...args: unknown[]) {
@@ -212,6 +175,34 @@ async function ensureWs(port: number) {
     const hasResult = msg.result !== undefined;
     const hasError = msg.error !== undefined;
     const type = String(msg.type ?? "");
+
+    // App-server can call client-provided dynamic tools over JSON-RPC.
+    if (id != null && typeof msg.method === "string" && !hasResult && !hasError) {
+      const requestId = id;
+      const method = msg.method;
+      const params = msg.params;
+      void (async () => {
+        try {
+          if (method !== "item/tool/call") {
+            throw new Error(`Unsupported server request: ${method}`);
+          }
+          const record = params && typeof params === "object" ? params as Record<string, unknown> : {};
+          const result = await executeComputerTool(String(record.tool ?? ""), record.arguments);
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ jsonrpc: "2.0", id: requestId, result }));
+          }
+        } catch (error) {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              jsonrpc: "2.0",
+              id: requestId,
+              error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+            }));
+          }
+        }
+      })();
+      return;
+    }
 
     // JSON-RPC 2.0 style: {id, result} or {id, error}
     if (id != null && (hasResult || hasError)) {
@@ -443,6 +434,16 @@ app.whenReady().then(async () => {
     return result.filePaths?.[0] ?? null;
   });
 
+  ipcMain.handle("open-workspace-dialog", async () => {
+    const window = mainWindow;
+    if (!window || window.isDestroyed()) return null;
+    const result = await dialog.showOpenDialog(window, {
+      title: "Select workspace folder",
+      properties: ["openDirectory", "createDirectory"],
+    });
+    return result.canceled ? null : result.filePaths?.[0] ?? null;
+  });
+
   ipcMain.handle("get-pasted-image", async () => {
     try {
       // 1) Direct image from clipboard
@@ -477,9 +478,9 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("read-local-image", async (_event, filePath: string) => {
+  ipcMain.handle("read-local-image", async (_event, filePath: string, cwd?: string) => {
     try {
-      return localImageToDataUrl(filePath);
+      return localImageToDataUrl(filePath, cwd);
     } catch (e) {
       console.error("[main] read-local-image error", e);
       return null;

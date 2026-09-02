@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "concurrently \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5174 && electron .\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
     "build:backend": "node build-backend.mjs",
     "build:lite": "node build-variant.mjs lite",
     "build:full": "node build-variant.mjs full",

@@ -2,6 +2,12 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import AssistantMessage, { assistantMessagePreserveWhitespace } from "@assistant-message";
 import { useStore } from "./store";
+import { ContextStatus } from "./ContextStatus";
+import { ToolStatus } from "./ToolStatus";
+import { WorkspaceControls } from "./WorkspaceControls";
+
+const WORKSPACE_STORAGE_KEY = "codex-stressced-workspace";
+const COMPUTER_USE_STORAGE_KEY = "codex-stressced-computer-use";
 
 function getThreadLabel(t: any): string {
   if (t.preview && t.preview.trim().length > 0) return t.preview.trim();
@@ -19,48 +25,15 @@ function isNearScrollBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight < 48;
 }
 
-/**
- * Compress and resize an image data URL to fit within the LLM context window.
- * Max dimension: 1200px (preserves text legibility).
- * Output: JPEG at 80% quality for readable screenshots.
- */
-function compressImage(dataUrl: string, maxDim = 1200, quality = 0.80): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      let w = img.width;
-      let h = img.height;
-      // Scale down if needed
-      if (w > maxDim || h > maxDim) {
-        if (w > h) {
-          h = Math.round(h * (maxDim / w));
-          w = maxDim;
-        } else {
-          w = Math.round(w * (maxDim / h));
-          h = maxDim;
-        }
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) { resolve(dataUrl); return; }
-      ctx.drawImage(img, 0, 0, w, h);
-      const compressed = canvas.toDataURL("image/jpeg", quality);
-      console.log(`[compress] ${img.width}x${img.height} → ${w}x${h}, ${(dataUrl.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB`);
-      resolve(compressed);
-    };
-    img.onerror = () => reject(new Error("Failed to load image for compression"));
-    img.src = dataUrl;
-  });
-}
-
 export default function App() {
   const store = useStore();
   const [input, setInput] = useState("");
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [showThinking, setShowThinking] = useState(false);
+  const [workspacePath, setWorkspacePath] = useState(() => localStorage.getItem(WORKSPACE_STORAGE_KEY) ?? "");
+  const [computerUse, setComputerUse] = useState(() => localStorage.getItem(COMPUTER_USE_STORAGE_KEY) === "true");
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const previousThreadIdRef = useRef<string | null>(null);
@@ -134,8 +107,37 @@ export default function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [scrollSignal]);
 
+  useLayoutEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) return;
+    composer.style.height = "0px";
+    const height = Math.min(240, Math.max(42, composer.scrollHeight));
+    composer.style.height = `${height}px`;
+    composer.style.overflowY = composer.scrollHeight > 240 ? "auto" : "hidden";
+  }, [input]);
+
   const handleChatScroll = (event: React.UIEvent<HTMLDivElement>) => {
     autoScrollRef.current = isNearScrollBottom(event.currentTarget);
+  };
+
+  const chooseWorkspace = async (): Promise<string | null> => {
+    const selected = await window.CodexStressCed?.openWorkspaceDialog?.();
+    if (!selected) return null;
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, selected);
+    setWorkspacePath(selected);
+    return selected;
+  };
+
+  const handleCreateThread = async () => {
+    const cwd = workspacePath || await chooseWorkspace();
+    if (!cwd) return;
+    await store.createThread({ cwd, computerUse });
+  };
+
+  const handleToggleComputerUse = () => {
+    const enabled = !computerUse;
+    localStorage.setItem(COMPUTER_USE_STORAGE_KEY, String(enabled));
+    setComputerUse(enabled);
   };
 
   // Ctrl+V image paste
@@ -217,22 +219,22 @@ export default function App() {
   };
 
   const handleSend = async () => {
+    if (store.isStreaming || store.compacting || store.loadingHistory) return;
     const text = (input || "").trim();
     let image = selectedImage || null;
     if (!text && !image) return;
     setInput("");
     setSelectedImage(null);
 
-    // Compress image before sending to avoid exceeding context window
-    if (image) {
-      try {
-        image = await compressImage(image);
-      } catch (err) {
-        console.error("[App] image compression failed:", err);
-      }
-    }
-
     try { await store.sendMessage(text, image); } catch {}
+  };
+
+  const handlePrimaryAction = async () => {
+    if (store.isStreaming) {
+      try { await store.stopTurn(); } catch {}
+      return;
+    }
+    await handleSend();
   };
 
   const handleToggleFullAccess = async () => {
@@ -311,7 +313,14 @@ export default function App() {
           </span>
         </div>
 
-        <button onClick={() => store.createThread()} style={{
+        <WorkspaceControls
+          workspacePath={workspacePath}
+          computerUse={computerUse}
+          onChooseWorkspace={() => { void chooseWorkspace(); }}
+          onToggleComputerUse={handleToggleComputerUse}
+        />
+
+        <button onClick={() => { void handleCreateThread(); }} style={{
           width: "100%", padding: "8px 0", borderRadius: 8,
           border: `1px solid ${C.accent}`, background: C.accentSoft,
           color: C.accent, fontSize: 13, fontWeight: 600,
@@ -347,6 +356,12 @@ export default function App() {
         position: "relative", display: "flex", flexDirection: "column",
         overflow: "hidden", minHeight: 0, background: C.bgDeep,
       }}>
+        {store.currentThreadId && <ContextStatus
+          usage={store.contextUsage}
+          compacting={store.compacting}
+          disabled={store.isStreaming || store.loadingHistory || store.connectionStatus !== "connected"}
+          onCompact={() => void store.compact()}
+        />}
         {store.currentThreadId ? (
           /* ── Chat area ── */
           <div ref={chatScrollRef} className="chat-scroll" onScroll={handleChatScroll} style={{
@@ -354,6 +369,17 @@ export default function App() {
             display: "flex", flexDirection: "column",
             padding: "20px 24px 12px",
           }}>
+            {store.historyCursor && <button className="history-more" disabled={store.loadingHistory || store.isStreaming}
+              onClick={async () => {
+                const element = chatScrollRef.current;
+                const height = element?.scrollHeight ?? 0;
+                const top = element?.scrollTop ?? 0;
+                await store.loadOlder();
+                requestAnimationFrame(() => {
+                  if (element) element.scrollTop = top + element.scrollHeight - height;
+                });
+              }}>Cargar mensajes anteriores</button>}
+            {store.loadingHistory && <div role="status" className="history-status">Cargando historial…</div>}
             {showThinking && store.thinkingMessages.map((m) => (
               <div key={m.id} style={{
                 ...contentColumnStyle, alignSelf: "center",
@@ -375,6 +401,7 @@ export default function App() {
             ))}
 
             {!showThinking && store.messages.map((m, index) => {
+              if (m.kind === "compaction") return <div key={m.id} className="history-status">{m.content}</div>;
               const isUser = m.role === "user";
               const isActiveAssistant =
                 !isUser && store.isStreaming && index === store.messages.length - 1;
@@ -395,6 +422,8 @@ export default function App() {
                         maxWidth: "80%",
                       }}>
                         {m.content}
+                        {m.images?.map((image, imageIndex) => <img key={imageIndex} src={image} alt="Imagen adjunta"
+                          style={{ display: "block", marginTop: 8, maxWidth: "100%", maxHeight: 200, borderRadius: 8, objectFit: "contain" }} />)}
                         {m.image && (
                           <img src={m.image} alt="Attached" style={{
                             display: "block", marginTop: 8, maxWidth: "100%",
@@ -403,7 +432,7 @@ export default function App() {
                         )}
                       </div>
                     </div>
-                  ) : (
+                  ) : m.content ? (
                     /* Assistant: left-aligned, full-width within column, subtle left accent */
                     <div style={{
                       padding: "12px 16px 12px 18px",
@@ -418,7 +447,7 @@ export default function App() {
                     }}>
                       <AssistantMessage content={m.content} streaming={isActiveAssistant} />
                     </div>
-                  )}
+                  ) : null}
 
                   {/* Tool calls */}
                   {m.toolCalls && m.toolCalls.length > 0 && (
@@ -434,7 +463,10 @@ export default function App() {
                             color: C.textDim, fontFamily: "var(--font-mono)",
                             fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere",
                             maxHeight: 160, overflowY: "auto",
-                          }}>{String(tc.input)}</div>
+                          }}>{typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input, null, 2)}</div>
+                          {tc.output && <details><summary>{tc.status === "failed" ? "Error" : "Resultado"}</summary>
+                            <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 200, overflowY: "auto" }}>{tc.output}</pre>
+                          </details>}
                           {tc.status === "pending" && (
                             <div style={{ display: "flex", gap: 6 }}>
                               <button onClick={() => store.approveToolCall(tc.id, tc.approvalId)} style={{
@@ -447,11 +479,7 @@ export default function App() {
                               }}>Deny</button>
                             </div>
                           )}
-                          {tc.status !== "pending" && (
-                            <div style={{ fontSize: 11, fontWeight: 500, color: tc.status === "approved" ? C.accent : C.danger }}>
-                              {tc.status === "approved" ? "✓ Allowed" : "✕ Denied"}
-                            </div>
-                          )}
+                          <ToolStatus status={tc.status} />
                         </div>
                       ))}
                     </div>
@@ -495,7 +523,7 @@ export default function App() {
             <div style={{ fontSize: 13, color: C.textMuted, maxWidth: 400, textAlign: "center", lineHeight: 1.5 }}>
               A local, self-contained Codex-style interface for llama.cpp.
             </div>
-            <button onClick={() => store.createThread()} style={{
+            <button onClick={() => { void handleCreateThread(); }} style={{
               marginTop: 8, padding: "10px 28px", borderRadius: 8,
               border: `1px solid ${C.accent}`, background: C.accentSoft,
               color: C.accent, fontSize: 14, fontWeight: 600,
@@ -544,10 +572,12 @@ export default function App() {
             }}>+</button>
 
             <textarea
+              ref={composerRef}
               style={{
                 flex: 1, resize: "none", border: "none", background: "transparent",
                 color: C.text, fontSize: 15, lineHeight: 1.5,
-                minHeight: 56, maxHeight: 240, outline: "none", padding: "10px 0",
+                height: 42, minHeight: 42, maxHeight: 240, overflowY: "hidden",
+                outline: "none", padding: "10px 0",
               }}
               placeholder={isNotReady ? "App-server not connected..." : "Message Codex Stressced..."}
               value={input}
@@ -557,14 +587,19 @@ export default function App() {
               rows={1}
             />
 
-            <button onClick={handleSend} style={{
+            <button
+              onClick={handlePrimaryAction}
+              disabled={store.loadingHistory || (!store.isStreaming && store.compacting)}
+              title={store.isStreaming ? "Stop" : "Send"}
+              aria-label={store.isStreaming ? "Stop" : "Send"}
+              style={{
               width: 36, height: 36, borderRadius: 10, border: "none",
-              background: input.trim() ? C.accent : C.bgCard,
-              color: input.trim() ? "#000" : C.textDim,
+              background: store.isStreaming ? C.text : input.trim() || selectedImage ? C.accent : C.bgCard,
+              color: store.isStreaming ? C.bgDeep : input.trim() || selectedImage ? "#000" : C.textDim,
               fontSize: 18, fontWeight: 700,
               display: "inline-flex", alignItems: "center", justifyContent: "center",
               cursor: "pointer", flexShrink: 0, transition: "background 0.15s",
-            }}>↑</button>
+            }}>{store.isStreaming ? "■" : "↑"}</button>
           </div>
 
           {/* Controls below prompt, left-aligned */}

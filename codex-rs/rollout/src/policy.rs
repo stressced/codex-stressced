@@ -135,6 +135,7 @@ fn should_persist_event_msg_extended(ev: &EventMsg) -> bool {
 fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
     match ev {
         EventMsg::UserMessage(_)
+        | EventMsg::ThreadSettingsApplied(_)
         | EventMsg::AgentMessage(_)
         | EventMsg::AgentReasoning(_)
         | EventMsg::AgentReasoningRawContent(_)
@@ -183,7 +184,6 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
-        | EventMsg::ThreadSettingsApplied(_)
         | EventMsg::McpToolCallBegin(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::TerminalInteraction(_)

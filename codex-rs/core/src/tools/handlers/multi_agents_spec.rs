@@ -764,7 +764,7 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             let reasoning_efforts_suffix = if efforts.is_empty() {
-                String::new()
+                " No configurable reasoning levels; omit reasoning_effort.".to_string()
             } else {
                 format!(" Reasoning efforts: {efforts}.")
             };

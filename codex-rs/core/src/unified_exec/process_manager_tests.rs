@@ -3,6 +3,10 @@ use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
+#[cfg(windows)]
+#[path = "windows_interrupt_tests.rs"]
+mod windows_interrupt_tests;
+
 #[test]
 fn unified_exec_env_injects_defaults() {
     let env = apply_unified_exec_env(HashMap::new());

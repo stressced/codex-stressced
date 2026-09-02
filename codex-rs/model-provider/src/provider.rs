@@ -248,6 +248,16 @@ impl ModelProvider for ConfiguredModelProvider {
                 model_catalog,
             )),
             None => {
+                // Keep local endpoint caches separate from OpenAI and from other local servers.
+                let codex_home = if self.info.name == "llama_cpp" {
+                    use std::hash::Hash;
+                    use std::hash::Hasher;
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    self.info.base_url.hash(&mut hash);
+                    codex_home.join(format!("local-model-catalog-{:x}", hash.finish()))
+                } else {
+                    codex_home
+                };
                 let endpoint: Arc<dyn codex_models_manager::manager::ModelsEndpointClient> =
                     if self.info.name == "gpt-oss" {
                         Arc::new(OllamaModelsEndpoint::new(self.info.base_url.clone()))

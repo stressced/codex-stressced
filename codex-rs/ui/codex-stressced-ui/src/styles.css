@@ -98,3 +98,26 @@ textarea::placeholder {
 button:hover {
   opacity: 0.88;
 }
+:root .context-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 24px;
+  color: #a7a7b4;
+  font-size: 12px;
+  border-bottom: 1px solid #292934;
+}
+.context-status button, .history-more {
+  color: inherit;
+  background: transparent;
+  border: 1px solid #454552;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.context-status button:disabled, .history-more:disabled { opacity: .45; cursor: default; }
+.history-more { align-self: center; margin-bottom: 12px; }
+.history-status { color: #a7a7b4; text-align: center; font-size: 12px; padding: 10px; }
+.tool-status { font-size: 11px; color: #86d5a5; }
+.tool-status-error { color: #f87171; }

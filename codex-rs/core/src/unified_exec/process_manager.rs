@@ -616,10 +616,21 @@ impl UnifiedExecProcessManager {
         let mut status_after_write = None;
 
         if !request.input.is_empty() {
-            if !tty {
+            let write_result = if tty {
+                process.write(request.input.as_bytes()).await
+            } else {
+                #[cfg(windows)]
+                {
+                    if request.input == "\u{3}" {
+                        process.interrupt_pipe().await
+                    } else {
+                        return Err(UnifiedExecError::StdinClosed);
+                    }
+                }
+                #[cfg(not(windows))]
                 return Err(UnifiedExecError::StdinClosed);
-            }
-            match process.write(request.input.as_bytes()).await {
+            };
+            match write_result {
                 Ok(()) => {
                     // Give the remote process a brief window to react so that we are
                     // more likely to capture its output in the poll below.

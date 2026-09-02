@@ -43,9 +43,7 @@ use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
-use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -99,9 +97,10 @@ pub async fn update_thread_settings(
     sub_id: String,
     thread_settings: ThreadSettingsOverrides,
 ) {
+    let _settings_guard = super::thread_settings::acquire_persistence_lock(sess).await;
     let updates = thread_settings_update(sess, thread_settings).await;
     let msg = match sess.update_settings(updates).await {
-        Ok(()) => thread_settings_applied_event(sess).await,
+        Ok(()) => super::thread_settings::applied_event(sess).await,
         Err(err) => EventMsg::Error(ErrorEvent {
             message: format!("invalid thread settings override: {err}"),
             codex_error_info: Some(CodexErrorInfo::BadRequest),
@@ -161,29 +160,6 @@ async fn thread_settings_update(
     }
 }
 
-async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
-    let snapshot = {
-        let state = sess.state.lock().await;
-        state.session_configuration.thread_config_snapshot()
-    };
-    EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
-        thread_settings: ThreadSettingsSnapshot {
-            model: snapshot.model,
-            model_provider_id: snapshot.model_provider_id,
-            service_tier: snapshot.service_tier,
-            approval_policy: snapshot.approval_policy,
-            approvals_reviewer: snapshot.approvals_reviewer,
-            permission_profile: snapshot.permission_profile,
-            active_permission_profile: snapshot.active_permission_profile,
-            cwd: snapshot.cwd,
-            reasoning_effort: snapshot.reasoning_effort,
-            reasoning_summary: snapshot.reasoning_summary,
-            personality: snapshot.personality,
-            collaboration_mode: snapshot.collaboration_mode,
-        },
-    })
-}
-
 pub(super) async fn user_input_or_turn_inner(
     sess: &Arc<Session>,
     sub_id: String,
@@ -201,6 +177,7 @@ pub(super) async fn user_input_or_turn_inner(
     else {
         unreachable!();
     };
+    let settings_guard = super::thread_settings::acquire_persistence_lock(sess).await;
     let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
     let mut updates = if emit_thread_settings_applied {
         thread_settings_update(sess, thread_settings).await
@@ -217,10 +194,11 @@ pub(super) async fn user_input_or_turn_inner(
     if emit_thread_settings_applied {
         sess.send_event_raw(Event {
             id: sub_id.clone(),
-            msg: thread_settings_applied_event(sess).await,
+            msg: super::thread_settings::applied_event(sess).await,
         })
         .await;
     }
+    drop(settings_guard);
     sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
         .await;
     let accepted_items = match sess

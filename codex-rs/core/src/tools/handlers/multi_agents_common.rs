@@ -425,6 +425,12 @@ fn validate_spawn_agent_reasoning_effort(
         return Ok(());
     }
 
+    if supported_reasoning_levels.is_empty() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "Model `{model}` does not expose configurable reasoning levels. Omit reasoning_effort to inherit the local model; do not change models to work around this error."
+        )));
+    }
+
     let supported = supported_reasoning_levels
         .iter()
         .map(|preset| preset.effort.to_string())

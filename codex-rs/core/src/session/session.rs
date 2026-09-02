@@ -23,6 +23,8 @@ pub(crate) struct Session {
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) out_of_band_elicitation_paused: watch::Sender<bool>,
     pub(super) state: Mutex<SessionState>,
+    /// Orders accepted settings updates and compaction checkpoints.
+    pub(super) settings_persistence_lock: Semaphore,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
@@ -1051,6 +1053,7 @@ impl Session {
                 agent_status,
                 out_of_band_elicitation_paused,
                 state: Mutex::new(state),
+                settings_persistence_lock: Semaphore::new(/*permits*/ 1),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
                 pending_mcp_server_refresh_config: Mutex::new(None),

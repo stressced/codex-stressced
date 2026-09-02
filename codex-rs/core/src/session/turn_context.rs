@@ -316,9 +316,13 @@ impl TurnContext {
     }
 
     pub(crate) fn compact_prompt(&self) -> &str {
-        self.compact_prompt
-            .as_deref()
-            .unwrap_or(compact::SUMMARIZATION_PROMPT)
+        self.compact_prompt.as_deref().unwrap_or_else(|| {
+            if self.provider.info().name == "llama_cpp" {
+                compact::LOCAL_SUMMARIZATION_PROMPT
+            } else {
+                compact::SUMMARIZATION_PROMPT
+            }
+        })
     }
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {

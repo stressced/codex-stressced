@@ -1886,6 +1886,10 @@ pub struct TurnStartedEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ThreadSettingsAppliedEvent {
+    /// Owning thread; copied snapshots retain the original owner. Absent in legacy histories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub thread_id: Option<ThreadId>,
     pub thread_settings: ThreadSettingsSnapshot,
 }
 
@@ -2364,7 +2368,19 @@ impl InitialHistory {
     pub fn session_cwd(&self) -> Option<PathBuf> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => session_cwd_from_items(&resumed.history),
+            InitialHistory::Resumed(resumed) => resumed
+                .history
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                        if event.thread_id == Some(resumed.conversation_id) =>
+                    {
+                        Some(event.thread_settings.cwd.to_path_buf())
+                    }
+                    _ => None,
+                })
+                .or_else(|| session_cwd_from_items(&resumed.history)),
             InitialHistory::Forked(items) => session_cwd_from_items(items),
         }
     }
