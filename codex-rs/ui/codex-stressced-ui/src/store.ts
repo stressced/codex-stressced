@@ -2,9 +2,11 @@
 let historyRequestVersion = 0;
 // src/store.ts
 import { create } from "zustand";
-import { rpc, onNotification, onConnectionStatus, ConnectionState, getLastError } from "./rpc";
+import { rpc, onNotification, onConnectionStatus, ConnectionState, getLastError, ensureConnected } from "./rpc";
 import { prependTurns, transcriptFromTurns, upsertCompletedMessage, type Message, type Role, type ThinkingMessage, type ToolCall, type ThreadReadResponse, type ThreadTurn, type TurnsPage } from "./history";
 import type { ContextUsage } from "./ContextStatus";
+import { Followups, emptyRun, type ConversationRun, type Prompt } from "./followups";
+import { DeltaBuffer } from "./deltaBuffer";
 import { COMPUTER_TOOL_SPEC } from "./computerTool";
 export type { Message, Role, ThinkingMessage, ToolCall } from "./history";
 
@@ -36,6 +38,11 @@ export type Thread = {
 
 
 type AppState = {
+  runs: Record<string, ConversationRun>;
+  refreshThreads: () => Promise<void>;
+  resumeQueue: (thread: string) => Promise<void>;
+  editQueued: (thread: string, id: string, text: string) => void;
+  removeQueued: (thread: string, id: string) => void;
   threads: Thread[];
   currentThreadId: string | null;
   messages: Message[];
@@ -56,7 +63,7 @@ type AppState = {
   init: () => Promise<void>;
   createThread: (options?: CreateThreadOptions) => Promise<void>;
   switchThread: (id: string) => Promise<void>;
-  sendMessage: (text: string, image?: string | null) => Promise<void>;
+  sendMessage: (text: string, image?: string | null, mode?: "queue" | "steer") => Promise<void>;
   stopTurn: () => Promise<void>;
   approveToolCall: (toolCallId: string, approvalId?: string) => Promise<void>;
   rejectToolCall: (toolCallId: string, approvalId?: string) => Promise<void>;
@@ -234,21 +241,6 @@ function responseTurnId(response: Record<string, unknown> | undefined): string {
   return "";
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function bestEffortInterruptTurn(threadId: string, turnId: string) {
-  try {
-    await Promise.race([
-      rpc("turn/interrupt", { threadId, turnId }),
-      sleep(1200),
-    ]);
-  } catch (err) {
-    console.error("[store] best-effort turn/interrupt failed:", err);
-  }
-}
-
 function notificationItemId(params: Record<string, unknown> | undefined): string {
   return stringValue(params?.itemId) || stringValue(params?.item_id) || turnItemId(params?.item);
 }
@@ -350,6 +342,10 @@ async function applyAccessSettings(threadId: string, fullAccess: boolean) {
 }
 
 export const useStore = create<AppState>((set, get) => ({
+  runs: {},
+  resumeQueue: thread => followups.resume(thread),
+  editQueued: (thread, id, text) => followups.edit(thread, id, text),
+  removeQueued: (thread, id) => followups.remove(thread, id),
   threads: [],
   currentThreadId: null,
   messages: [],
@@ -366,32 +362,37 @@ export const useStore = create<AppState>((set, get) => ({
   loadingHistory: false,
 
   init: async () => {
+    if (storeInitialized) return;
+    storeInitialized = true;
+    onNotification(data => {
+      const method = String(data.method ?? "");
+      if (["item/agentMessage/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta"].includes(method)) {
+        deltaBuffer.push(method, (data.params ?? {}) as Record<string, unknown>);
+      } else {
+        deltaBuffer.flush();
+        get().onNotification(data);
+      }
+    });
     onConnectionStatus((status, message) => {
-      set({
-        connectionStatus: status,
-        connectionError: status === "error" ? (message ?? null) : null,
-        ...(status === "error" || status === "closed" ? { isStreaming: false, streaming: null, compacting: false } : {}),
-      });
+      const previous = get().connectionStatus;
+      if (status !== "connected") {
+        deltaBuffer.flush();
+        for (const thread of Object.keys(get().runs)) followups.disconnected(thread);
+      }
+      set({ connectionStatus: status, connectionError: status === "error" ? message ?? null : null });
+      if (status === "connected" && (previous !== "connected" || !initialListLoaded)) {
+        initialListLoaded = true;
+        void (async () => {
+          await get().refreshThreads();
+          const current = get().currentThreadId;
+          if (current) await get().switchThread(current);
+        })();
+      }
     });
+    try { await ensureConnected(); } catch { /* transport retries and reports status */ }
+  },
 
-    onNotification((data) => {
-      get().onNotification(data);
-    });
-
-    // Wait until app-server is actually connected before doing RPC.
-    await new Promise<void>((resolve) => {
-      let ok = false;
-      const unsub = onConnectionStatus((s) => {
-        if (s === "connected" && !ok) {
-          ok = true;
-          unsub();
-          resolve();
-        }
-      });
-      // Fallback: if we never see "connected", don't hang forever.
-      setTimeout(() => { if (!ok) { unsub(); resolve(); } }, 12000);
-    });
-
+  refreshThreads: async () => {
     try {
       console.log("[store] RPC thread/list");
       type ThreadListRaw = { id: string; name?: string | null; preview?: string | null; modelProvider?: string; cwd?: string; status?: { type: string }; updatedAt?: number };
@@ -415,7 +416,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({ threads });
     } catch (err) {
       console.error("[store] thread/list failed:", err);
-      set({ threads: [] });
+      set({ connectionError: extractRpcError(err) });
     }
   },
 
@@ -465,15 +466,17 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   switchThread: async (id) => {
-    if (get().currentThreadId === id && (get().isStreaming || get().loadingHistory)) return;
+    if (get().currentThreadId === id && get().loadingHistory) return;
+    deltaBuffer.flush();
     const version = ++historyRequestVersion;
     const storedFullAccess = readStoredFullAccess(id);
-    resetToolProgress();
+    resetToolProgress(get().runs[id]?.turnId ?? null);
     set({ currentThreadId: id, messages: [], thinkingMessages: [], streaming: null,
-      isStreaming: false, compacting: false, contextUsage: null,
+      isStreaming: get().runs[id]?.busy ?? false, compacting: get().runs[id]?.compacting ?? false, contextUsage: null,
       historyTurns: [], historyCursor: null, loadingHistory: true,
       fullAccess: storedFullAccess, connectionError: null });
     try {
+      const runBeforeResume = get().runs[id];
       const resumed = await rpc<{ thread: { status?: { type?: string }; cwd?: string } }>("thread/resume", { threadId: id, excludeTurns: true });
       if (version !== historyRequestVersion) return;
       if (resumed.thread.cwd) {
@@ -481,8 +484,10 @@ export const useStore = create<AppState>((set, get) => ({
           threads: state.threads.map((thread) => thread.id === id ? { ...thread, cwd: resumed.thread.cwd } : thread),
         }));
       }
-      if (resumed.thread.status?.type === "active") set({ isStreaming: true });
+      const busy = resumed.thread.status?.type === "active";
+      if (get().runs[id] === runBeforeResume) followups.reconcile(id, busy, busy ? get().runs[id]?.turnId ?? null : null);
       if (storedFullAccess) await applyAccessSettings(id, true);
+      const runBeforeHistory = get().runs[id];
       let turns: ThreadTurn[];
       let cursor: string | null = null;
       try {
@@ -499,6 +504,9 @@ export const useStore = create<AppState>((set, get) => ({
         turns = response.thread.turns ?? [];
       }
       if (version !== historyRequestVersion || get().currentThreadId !== id) return;
+      const activeTurn = turns.find(turn => (turn as ThreadTurn & { status?: string }).status === "inProgress");
+      if (activeTurn && get().runs[id] === runBeforeHistory) followups.reconcile(id, true, activeTurn.id);
+      resetToolProgress(get().runs[id]?.turnId ?? null);
       const transcript = transcriptFromTurns(turns);
       set(state => ({
         messages: [...transcript.messages.filter(m => !state.messages.some(x => x.id === m.id)), ...state.messages],
@@ -541,140 +549,28 @@ export const useStore = create<AppState>((set, get) => ({
   compact: async () => {
     const { currentThreadId: id, compacting, isStreaming, loadingHistory } = get();
     if (!id || compacting || isStreaming || loadingHistory) return;
+    followups.compacting(id, true);
     set({ compacting: true, connectionError: null });
     try {
       await rpc("thread/compact/start", { threadId: id });
     } catch (error) {
+      followups.compacting(id, false);
       if (get().currentThreadId === id) set({ compacting: false, connectionError: extractRpcError(error) });
     }
   },
 
-  sendMessage: async (text, image) => {
-    if (get().compacting || get().loadingHistory) return;
-    console.log("[store] sendMessage called with text:", text);
-    const { currentThreadId, connectionStatus, fullAccess, isStreaming, threads } = get();
-    console.log("[store] sendMessage state:", { currentThreadId, connectionStatus });
-    if (!currentThreadId) {
-      console.log("[store] sendMessage: no currentThreadId, returning");
-      return;
-    }
-    if (connectionStatus !== "connected") {
-      console.warn("[store] sendMessage: not connected, status:", connectionStatus);
-      set((s) => ({
-        isStreaming: false,
-        streaming: null,
-        connectionError: "Not connected to app-server; cannot send message."
-      }));
-      return;
-    }
-    const activeCwd = threads.find((thread) => thread.id === currentThreadId)?.cwd;
-
-    const activeTurnId = toolProgress.turnId;
-    if (isStreaming && activeTurnId) {
-      await bestEffortInterruptTurn(currentThreadId, activeTurnId);
-      resetToolProgress();
-    }
-
-    const textImagePaths = extractLocalImagePaths(text);
-    if (textImagePaths.length > 0) {
-      console.log("[store] sendMessage detected local image paths:", textImagePaths);
-    }
-
-    const { messages } = get();
-    const userMsg: Message = {
-      id: nextId(),
-      role: "user",
-      content: text.trim(),
-      image: image || undefined,
-      toolCalls: [],
-    };
-    resetToolProgress();
-    set({
-      messages: [...messages, userMsg],
-      streaming: "",
-      isStreaming: true,
-      connectionError: null,
-    });
-
-    try {
-      if (fullAccess) {
-        console.log("[store] RPC thread/settings/update full access before turn/start", currentThreadId);
-        await applyAccessSettings(currentThreadId, true);
-        console.log("[store] RPC thread/settings/update full access before turn/start OK");
-      }
-
-      const inputParts: Record<string, unknown>[] = [{ type: "text", text: text.trim() }];
-      const includedLocalImages = new Set<string>();
-      let embeddedLocalImageCount = 0;
-
-      for (const path of textImagePaths) {
-        includedLocalImages.add(path.toLowerCase());
-        const dataUrl = await readLocalImageDataUrl(path, activeCwd);
-        if (dataUrl) {
-          inputParts.push({ type: "image", url: dataUrl, detail: "high" });
-          embeddedLocalImageCount += 1;
-        } else {
-          inputParts.push({ type: "localImage", path, detail: "high" });
-        }
-      }
-
-      if (image) {
-        if (image.startsWith("data:")) {
-          // Data URL -> use "image" type with field "url" (v2 protocol).
-          inputParts.push({ type: "image", url: image, detail: "high" });
-        } else {
-          const imageKey = image.toLowerCase();
-          if (!includedLocalImages.has(imageKey)) {
-            const dataUrl = await readLocalImageDataUrl(image, activeCwd);
-            if (dataUrl) {
-              inputParts.push({ type: "image", url: dataUrl, detail: "high" });
-              embeddedLocalImageCount += 1;
-            } else {
-              inputParts.push({ type: "localImage", path: image, detail: "high" });
-            }
-          }
-        }
-      }
-
-      console.log("[store] RPC turn/start", {
-        threadId: currentThreadId,
-        input: [{ type: "Text", text: text.trim() }],
-        localImagePaths: textImagePaths,
-        embeddedLocalImageCount,
-      });
-      const turnRes = await rpc<Record<string, unknown>>("turn/start", {
-        threadId: currentThreadId,
-        ...accessPolicyParams(fullAccess),
-        input: inputParts,
-      });
-      const startedTurnId = responseTurnId(turnRes);
-      if (startedTurnId) {
-        toolProgress.turnId = startedTurnId;
-      }
-      console.log("[store] RPC turn/start response", turnRes);
-    } catch (err) {
-      console.error("[store] turn/start failed:", err);
-      const msg = extractRpcError(err);
-      console.log("[store] turn/start error message:", msg);
-      set({
-        isStreaming: false,
-        streaming: null,
-        connectionError: msg || "Error sending message",
-      });
-    }
+  sendMessage: async (text, image, mode = "queue") => {
+    const { currentThreadId, loadingHistory } = get();
+    if (!currentThreadId || loadingHistory) throw new Error("Select a conversation and wait for its history to load.");
+    if (!text.trim() && !image) return;
+    await followups.submit(currentThreadId, { id: nextId(), text: text.trim(), image }, mode);
   },
 
   stopTurn: async () => {
-    const { currentThreadId, isStreaming } = get();
-    const turnId = toolProgress.turnId;
-    if (!currentThreadId || !isStreaming || !turnId) return;
-
-    try {
-      await rpc("turn/interrupt", { threadId: currentThreadId, turnId });
-    } catch (err) {
-      console.error("[store] stopTurn failed:", err);
-      set({ connectionError: extractRpcError(err) });
-    }
+    const thread = get().currentThreadId;
+    if (!thread) return;
+    try { await followups.stop(thread); }
+    catch (error) { set({ connectionError: extractRpcError(error) }); }
   },
 
   approveToolCall: async (toolCallId: string, approvalId?: string) => {
@@ -766,6 +662,19 @@ export const useStore = create<AppState>((set, get) => ({
 
     // Every live turn event belongs to a thread, including child-agent output.
     const eventThreadId = notificationThreadId(params);
+    const completionId = (params?.turn as { id?: string } | undefined)?.id;
+    if (method === "turn/completed" && eventThreadId && completionId === get().runs[eventThreadId]?.lastCompletedTurnId) return;
+    if (method === "turn/completed" && eventThreadId && completionId && get().runs[eventThreadId]?.turnId &&
+        completionId !== get().runs[eventThreadId].turnId) return;
+    const knownThread = eventThreadId && (eventThreadId === get().currentThreadId || eventThreadId in get().runs);
+    if (knownThread) {
+      const turn = params?.turn as { id?: string; status?: string; error?: { message?: string } } | undefined;
+      if (method === "turn/started" && turn?.id) followups.started(eventThreadId, turn.id);
+      if (method === "turn/completed") followups.completed(eventThreadId, turn?.id, turn?.status ?? "completed", turn?.error?.message);
+      if (method === "item/started" && itemType(params?.item) === "contextCompaction") followups.compacting(eventThreadId, true);
+      if (method === "item/completed" && itemType(params?.item) === "contextCompaction") followups.compacting(eventThreadId, false);
+      if (method === "error" && params?.willRetry !== true) followups.disconnected(eventThreadId);
+    }
     if (eventThreadId && eventThreadId !== get().currentThreadId) return;
     if (method === "thread/tokenUsage/updated") {
       const usage = params?.tokenUsage as { last?: { totalTokens?: number }; modelContextWindow?: number | null } | undefined;
@@ -827,6 +736,15 @@ export const useStore = create<AppState>((set, get) => ({
       const item = params?.item;
       const type = itemType(item);
       if (type === "contextCompaction") { set({ compacting: true }); return; }
+      if (type === "userMessage") {
+        const canonical = transcriptFromTurns([{ id: turnId, items: [item as Record<string, unknown>] }]).messages[0];
+        if (canonical) set(state => {
+          const optimistic = state.messages.findIndex(message => message.role === "user" && message.id.startsWith("id-") && message.content === canonical.content);
+          if (optimistic < 0) return { messages: upsertCompletedMessage(state.messages, canonical) };
+          return { messages: state.messages.map((message, index) => index === optimistic ? { ...message, id: canonical.id } : message) };
+        });
+        return;
+      }
       if (!type || type === "reasoning" || type === "agentMessage" || type === "userMessage") return;
 
       toolProgress.started += 1;
@@ -951,3 +869,85 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 }));
+
+let storeInitialized = false;
+let initialListLoaded = false;
+const deltaBuffer = new DeltaBuffer(events => {
+  for (const event of events) useStore.getState().onNotification(event);
+});
+
+const followups: Followups = new Followups({
+  get: thread => useStore.getState().runs[thread] ?? emptyRun,
+  set: (thread, run) => useStore.setState(state => ({
+    runs: { ...state.runs, [thread]: run },
+    ...(state.currentThreadId === thread ? {
+      isStreaming: run.busy, compacting: run.compacting,
+      ...(run.error || state.connectionError === state.runs[thread]?.error ? { connectionError: run.error } : {}),
+    } : {}),
+  })),
+  connected: () => useStore.getState().connectionStatus === "connected",
+  interrupt: async (threadId, turnId) => { await rpc("turn/interrupt", { threadId, turnId }); },
+  send: async (currentThreadId: string, prompt: Prompt, expectedTurnId?: string) => {
+    const { text, image } = prompt;
+    const state = useStore.getState();
+    const fullAccess = state.currentThreadId === currentThreadId ? state.fullAccess : readStoredFullAccess(currentThreadId);
+    const activeCwd = state.threads.find(thread => thread.id === currentThreadId)?.cwd;
+    const textImagePaths = extractLocalImagePaths(text);
+    const inputParts: Record<string, unknown>[] = [{ type: "text", text: text.trim() }];
+    const includedLocalImages = new Set<string>();
+
+    for (const path of textImagePaths) {
+      includedLocalImages.add(path.toLowerCase());
+      const dataUrl = await readLocalImageDataUrl(path, activeCwd);
+      if (dataUrl) {
+        inputParts.push({ type: "image", url: dataUrl, detail: "high" });
+      } else {
+        inputParts.push({ type: "localImage", path, detail: "high" });
+      }
+    }
+
+    if (image) {
+      if (image.startsWith("data:")) {
+        // Data URL -> use "image" type with field "url" (v2 protocol).
+        inputParts.push({ type: "image", url: image, detail: "high" });
+      } else {
+        const imageKey = image.toLowerCase();
+        if (!includedLocalImages.has(imageKey)) {
+          const dataUrl = await readLocalImageDataUrl(image, activeCwd);
+          if (dataUrl) {
+            inputParts.push({ type: "image", url: dataUrl, detail: "high" });
+          } else {
+            inputParts.push({ type: "localImage", path: image, detail: "high" });
+          }
+        }
+      }
+    }
+
+    if (!expectedTurnId && fullAccess) await applyAccessSettings(currentThreadId, true);
+    const run = useStore.getState().runs[currentThreadId];
+    if (expectedTurnId && (!run?.busy || run.turnId !== expectedTurnId || run.compacting)) {
+      throw new Error("The active turn changed. Your message is still in the composer; send it as Queue.");
+    }
+    const visible = () => useStore.getState().currentThreadId === currentThreadId;
+    if (visible()) {
+      deltaBuffer.flush();
+      useStore.setState(state => ({ messages: [...state.messages, {
+        id: prompt.id, role: "user", content: text, image: image || undefined,
+      }], connectionError: null }));
+    }
+    try {
+      const result = await rpc<Record<string, unknown>>(expectedTurnId ? "turn/steer" : "turn/start", {
+        threadId: currentThreadId,
+        ...(expectedTurnId ? { expectedTurnId } : accessPolicyParams(fullAccess)),
+        input: inputParts,
+      });
+      return responseTurnId(result);
+    } catch (error) {
+      if (visible()) useStore.setState(state => ({
+        messages: state.messages.filter(message => message.id !== prompt.id),
+        connectionError: extractRpcError(error),
+      }));
+      throw error;
+    }
+  },
+});

@@ -1,10 +1,13 @@
 // electron/main.ts
-import { app, BrowserWindow, clipboard, ipcMain, shell, dialog, nativeImage } from "electron";
+import { app, BrowserWindow, clipboard, ipcMain, shell, dialog } from "electron";
 import path from "path";
 import { spawn } from "child_process";
 import fs from "fs";
+import net from "node:net";
 import { executeComputerTool } from "./computer-use";
+import { AppServerConnection } from "./connection";
 import { localImageToDataUrl } from "./image-attachment";
+import { backendEnvironment } from "./backend-environment";
 
 const LOG_FILE = path.join(
   process.env.USERPROFILE || process.env.HOME || "",
@@ -34,25 +37,6 @@ let mainWindow: BrowserWindow | null = null;
 let appServerProc: ReturnType<typeof spawn> | null = null;
 let isQuitting = false;
 
-let ws: WebSocket | null = null;
-let wsId = 1;
-let wsPending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
-let wsConnecting = false;
-
-// Active port where WebSocket is connected; used by RPC to avoid forcing a specific port.
-let activeWsPort: number | null = null;
-
-const LLAMA_CPP_URL = "http://127.0.0.1:8080/v1";
-const DEFAULT_RPC_TIMEOUT_MS = 30_000;
-const LONG_RPC_TIMEOUT_MS = 5 * 60_000;
-
-function rpcTimeoutMs(method: string): number {
-  if (method === "turn/start" || method === "thread/read" || method === "thread/resume") {
-    return LONG_RPC_TIMEOUT_MS;
-  }
-  return DEFAULT_RPC_TIMEOUT_MS;
-}
-
 function sendToRenderer(channel: string, ...args: unknown[]) {
   try {
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -69,12 +53,6 @@ function logMain(...args: unknown[]) {
     mainWindow?.webContents?.send("main-log", ...args);
   } catch {
     // ignore
-  }
-}
-
-function logDebug(...args: unknown[]) {
-  if (DEBUG_LOGS) {
-    logMain(...args);
   }
 }
 
@@ -107,7 +85,7 @@ function findCodexBinary(): string | null {
 async function probeAppServer(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const http = require("http");
-    http.get(
+    const req = http.get(
       {
         host: "127.0.0.1",
         port,
@@ -120,200 +98,64 @@ async function probeAppServer(port: number): Promise<boolean> {
         resolve(ok);
       }
     ).on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
   });
 }
 
-async function ensureWs(port: number) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    activeWsPort = port;
-    return;
-  }
-  if (wsConnecting) return;
-  wsConnecting = true;
-
-  const url = "ws://127.0.0.1:" + port + "/rpc";
-
-  try {
-    ws = new WebSocket(url);
-  } catch (err) {
-    wsConnecting = false;
-    sendToRenderer("connection-status", "error", "WS connect error: " + err);
-    return;
-  }
-
-  ws.onopen = () => {
-    wsConnecting = false;
-    activeWsPort = port;
-    sendToRenderer("connection-status", "connected", "Connected to app-server on " + port);
-    (async () => {
-      try {
-        await rpcRequest("initialize", {
-          clientInfo: { name: "codex-stressced-ui", version: "0.1.0" },
-          capabilities: { experimentalApi: true, requestAttestation: false },
-        });
-        rpcNotify("initialized");
-      } catch {
-        // non-critical
-      }
-    })();
-  };
-
-  ws.onmessage = (event: any) => {
-    if (typeof event.data !== "string") return;
-    const raw = String(event.data);
-    if (DEBUG_LOGS) {
-      console.log("[WS] raw", raw.substring(0, 500));
-    }
-    let msg: Record<string, unknown>;
-    try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
-
-    const id = msg.id;
-    const hasResult = msg.result !== undefined;
-    const hasError = msg.error !== undefined;
-    const type = String(msg.type ?? "");
-
-    // App-server can call client-provided dynamic tools over JSON-RPC.
-    if (id != null && typeof msg.method === "string" && !hasResult && !hasError) {
-      const requestId = id;
-      const method = msg.method;
-      const params = msg.params;
-      void (async () => {
-        try {
-          if (method !== "item/tool/call") {
-            throw new Error(`Unsupported server request: ${method}`);
-          }
-          const record = params && typeof params === "object" ? params as Record<string, unknown> : {};
-          const result = await executeComputerTool(String(record.tool ?? ""), record.arguments);
-          if (ws?.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ jsonrpc: "2.0", id: requestId, result }));
-          }
-        } catch (error) {
-          if (ws?.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              jsonrpc: "2.0",
-              id: requestId,
-              error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
-            }));
-          }
-        }
-      })();
-      return;
-    }
-
-    // JSON-RPC 2.0 style: {id, result} or {id, error}
-    if (id != null && (hasResult || hasError)) {
-      const rid = Number(id);
-      const p = wsPending.get(rid);
-      if (p) {
-        wsPending.delete(rid);
-        if (hasError) {
-          p.reject(new Error(JSON.stringify(msg.error)));
-        } else {
-          p.resolve(msg.result);
-        }
-      }
-      return;
-    }
-
-    // Legacy rpc_response envelope (if present)
-    if (type === "rpc_response") {
-      const rid = Number(msg.id);
-      const p = wsPending.get(rid);
-      if (!p) return;
-      wsPending.delete(rid);
-      if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
-      else p.resolve(msg.result);
-      return;
-    }
-
-    // Notifications: either type === "notification" or has method and no id
-    if (type === "notification" || (msg.method && id == null)) {
-      logDebug("[WS] notification", String(msg.method ?? type));
-      sendToRenderer("notification", msg);
-      return;
-    }
-  };
-
-  ws.onerror = (err: any) => {
-    logMain("[WS] error", err?.message ?? "ws-error");
-  };
-
-  ws.onclose = (event: CloseEvent) => {
-    logMain("[WS] closed", {
-      code: event.code,
-      reason: event.reason,
-      wasClean: event.wasClean,
-    });
-    ws = null;
-    activeWsPort = null;
-    if (!isQuitting) {
-      sendToRenderer("connection-status", "error", "WebSocket closed unexpectedly");
-    }
-  };
-}
-
-async function rpcRequest<T>(method: string, params?: Record<string, unknown>): Promise<T> {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    throw new Error("not connected");
-  }
-  const id = wsId++;
-  const msg = { jsonrpc: "2.0", id, method, params };
-  logDebug("[WS] request", msg);
-  ws.send(JSON.stringify(msg));
+let selectedPort: number | null = null;
+async function availablePort(preferred: number): Promise<number> {
   return new Promise((resolve, reject) => {
-    const timeoutMs = rpcTimeoutMs(method);
-    const timer = setTimeout(() => {
-      wsPending.delete(id);
-      logMain("[WS] rpc timeout", { id, method, timeoutMs });
-      reject(new Error("RPC timeout"));
-    }, timeoutMs);
-    wsPending.set(id, {
-      resolve: (v: unknown) => {
-        clearTimeout(timer);
-        resolve(v as T);
-      },
-      reject: (e: unknown) => {
-        clearTimeout(timer);
-        reject(e);
-      },
+    const probe = net.createServer();
+    probe.once("error", error => {
+      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE" && preferred !== 0) {
+        availablePort(0).then(resolve, reject);
+      } else reject(error);
+    });
+    probe.listen(preferred, "127.0.0.1", () => {
+      const port = (probe.address() as net.AddressInfo).port;
+      probe.close(error => error ? reject(error) : resolve(port));
     });
   });
 }
+const connection = new AppServerConnection({
+  endpoint: async () => {
+    // Probe again after a crash. Keep using the chosen port while our child starts.
+    if (selectedPort && await probeAppServer(selectedPort)) return `ws://127.0.0.1:${selectedPort}/rpc`;
+    if (appServerProc && selectedPort) return `ws://127.0.0.1:${selectedPort}/rpc`;
+    for (const port of [1422, 1421]) {
+      if (await probeAppServer(port)) { selectedPort = port; return `ws://127.0.0.1:${port}/rpc`; }
+    }
+    if (isQuitting) throw new Error("Application is closing");
+    // An unresponsive listener must not block launch or be killed on the user's behalf.
+    selectedPort = await availablePort(1422);
+    await startAppServer(selectedPort);
+    return `ws://127.0.0.1:${selectedPort}/rpc`;
+  },
+  status: (state, message) => {
+    logMain("[connection]", state, message ?? "");
+    sendToRenderer("connection-status", state, message);
+  },
+  notification: message => sendToRenderer("notification", message),
+  tool: async (method, params) => {
+    if (method !== "item/tool/call") throw new Error(`Unsupported server request: ${method}`);
+    const record = params && typeof params === "object" ? params as Record<string, unknown> : {};
+    return executeComputerTool(String(record.tool ?? ""), record.arguments);
+  },
+});
 
-function rpcNotify(method: string, params?: Record<string, unknown>) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const msg = { method, params };
-  logDebug("[WS] notify", msg);
-  ws.send(JSON.stringify(msg));
-}
-
-async function startAppServer() {
+async function startAppServer(port: number) {
   const bin = findCodexBinary();
   if (!bin) {
-    console.warn("[main] codex binary not found; UI will try existing app-server");
-    return;
+    throw new Error("Bundled codexstressced backend not found. Reopen the portable executable to extract its resources again.");
   }
 
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    RUST_BACKTRACE: process.env.RUST_BACKTRACE ?? "1",
-    RUST_LOG:
-      process.env.RUST_LOG ??
-      "warn",
-  };
+  const env = backendEnvironment(bin, process.env);
 
-  if (!env.CODEX_HOME) {
-    const home = env.USERPROFILE || process.env.HOME || "";
-    env.CODEX_HOME = path.join(home, ".llmlocal");
-  }
-
-  logMain("[main] spawning app-server:", bin, "app-server", "--listen", "ws://127.0.0.1:1422");
-  const proc = spawn(bin, ["app-server", "--listen", "ws://127.0.0.1:1422"], {
-    stdio: ["ignore", DEBUG_LOGS ? "pipe" : "ignore", DEBUG_LOGS ? "pipe" : "ignore"],
+  const endpoint = `ws://127.0.0.1:${port}`;
+  logMain("[main] spawning app-server:", bin, "app-server", "--listen", endpoint);
+  const proc = spawn(bin, ["app-server", "--listen", endpoint], {
+    stdio: ["ignore", DEBUG_LOGS ? "pipe" : "ignore", "pipe"],
+    windowsHide: true,
     env,
     detached: false,
   });
@@ -332,18 +174,20 @@ async function startAppServer() {
       if (text) logMain("[app-server]", text);
     });
 
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text) logMain("[app-server-err]", text);
-    });
   }
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    const text = chunk.toString().trim();
+    if (text) logMain("[app-server-err]", text);
+  });
 
   proc.on("exit", (code, signal) => {
     logMain("[main] app-server exited", { code, signal });
+    if (appServerProc === proc) appServerProc = null;
   });
 
   proc.on("error", (err: Error) => {
-    logMain("[main] app-server spawn error", err);
+    logMain("[main] app-server spawn error", err.message);
+    if (appServerProc === proc) appServerProc = null;
   });
 
   appServerProc = proc;
@@ -397,10 +241,7 @@ async function createWindow() {
 
 ipcMain.handle("rpc", async (_event, method: string, params?: Record<string, unknown>) => {
   try {
-    // Prefer the already-connected port so we don't force 1422 and break if server is on 1421.
-    const port = activeWsPort ?? 1422;
-    await ensureWs(port);
-    return await rpcRequest(method, params);
+    return await connection.request(method, params);
   } catch (err) {
     return {
       __rpc_error: true,
@@ -408,6 +249,9 @@ ipcMain.handle("rpc", async (_event, method: string, params?: Record<string, unk
     };
   }
 });
+
+ipcMain.handle("connection-status", () => connection.status);
+ipcMain.handle("connect", () => connection.connect().then(() => connection.status).catch(() => connection.status));
 
 ipcMain.on("renderer-log", (_event, msg: string) => {
   if (DEBUG_LOGS) {
@@ -584,39 +428,11 @@ ipcMain.handle("read-thread-history", async (_event, filePath: string) => {
       return null;
     }
   });
-  const use1421 = await probeAppServer(1421);
-  const use1422 = await probeAppServer(1422);
-
-  if (use1421) {
-    console.log("[main] using existing app-server on 1421");
-  } else if (use1422) {
-    console.log("[main] using existing app-server on 1422");
-  } else {
-    try {
-      await startAppServer();
-    } catch (err) {
-      logMain("[main] app-server start failed", err);
-    }
-  }
-
-  // Wait a bit for app-server, then connect.
-  sendToRenderer("connection-status", "connecting", "Connecting to app-server...");
-  setTimeout(async () => {
-    const target = use1421 ? 1421 : use1422 ? 1422 : 1422;
-    try {
-      await ensureWs(target);
-    } catch {
-      // renderer will see connection-status
-    }
-  }, 2500);
+  void connection.connect().catch(() => {});
 
   app.on("before-quit", () => {
     isQuitting = true;
-    try {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
-    } catch { /* ignore */ }
+    connection.close();
     if (appServerProc) {
       try { appServerProc.kill("SIGTERM"); } catch { /* ignore */ }
     }

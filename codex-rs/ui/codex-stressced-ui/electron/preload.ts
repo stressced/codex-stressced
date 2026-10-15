@@ -30,6 +30,9 @@ if (DEBUG_LOGS) {
 }
 
 contextBridge.exposeInMainWorld("CodexStressCed", {
+  connect: () => ipcRenderer.invoke("connect"),
+  getConnectionStatus: () => ipcRenderer.invoke("connection-status"),
+
   rpc: async (method: string, params?: Record<string, unknown>) => {
     return ipcRenderer.invoke("rpc", method, params);
   },

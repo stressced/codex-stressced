@@ -1,6 +1,6 @@
 import { desktopCapturer, screen } from "electron";
 import { spawn } from "child_process";
-import { COMPUTER_TOOL_NAME } from "../src/computerTool";
+import { COMPUTER_TOOL_NAME, COMPUTER_TOOL_SPEC } from "../src/computerTool";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -214,6 +214,12 @@ Add-Type -TypeDefinition ${powershellLiteral(NATIVE_METHODS)}
 
 async function performAction(args: JsonRecord): Promise<string> {
   const action = stringArgument(args, "action");
+  if (!COMPUTER_TOOL_SPEC.inputSchema.properties.action.enum.includes(action)) {
+    throw new Error(
+      `Unsupported computer action: ${action}. Valid actions: ${COMPUTER_TOOL_SPEC.inputSchema.properties.action.enum.join(", ")}. ` +
+      'For a left click use {"action":"click","button":"left","x":100,"y":100}, replacing x/y with the target coordinates from the screenshot.',
+    );
+  }
   if (action === "screenshot") return "Captured the primary display.";
   if (action === "wait") {
     const milliseconds = Math.min(10_000, Math.max(0, integerArgument(args, "milliseconds", 1000)));

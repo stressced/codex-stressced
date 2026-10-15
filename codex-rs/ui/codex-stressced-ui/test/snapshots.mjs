@@ -22,3 +22,25 @@ console.log(`workspace-empty: ${renderToStaticMarkup(React.createElement(Workspa
 console.log(`workspace-enabled: ${renderToStaticMarkup(React.createElement(WorkspaceControls, {
   workspacePath: "D:\\\\qwenst1", computerUse: true, onChooseWorkspace() {}, onToggleComputerUse() {},
 }))}`);
+
+const { ComposerActions } = await loadSource("../src/ComposerActions.tsx");
+for (const [name, props] of Object.entries({
+  idle: { busy: false, compacting: false, canSteer: false },
+  active: { busy: true, compacting: false, canSteer: true },
+  starting: { busy: true, compacting: false, canSteer: false },
+  compacting: { busy: true, compacting: true, canSteer: true },
+  disconnected: { busy: true, ready: false, canSteer: true },
+})) {
+  console.log(`composer-${name}: ${renderToStaticMarkup(React.createElement(ComposerActions, {
+    sending: false, hasInput: true, ready: true, canSend: true,
+    onSend() {}, onSteer() {}, onStop() {}, ...props,
+  }))}`);
+}
+const { QueuePanelView } = await loadSource('../src/QueuePanel.tsx');
+const { emptyRun } = await loadSource('../src/followups.ts');
+for (const paused of [false, true]) {
+  console.log(`queue-${paused ? 'paused' : 'waiting'}: ${renderToStaticMarkup(React.createElement(QueuePanelView, {
+    threadId: 'preview', connected: true,
+    run: { ...emptyRun, paused, queue: [{ id: 'one', text: 'Revisa los tests' }, { id: 'two', text: 'Compara la captura', image: 'data:image/png;base64,test' }] },
+  }))}`);
+}

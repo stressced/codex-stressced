@@ -152,3 +152,54 @@ test("tool completion replaces an approval card without duplicating it", () => {
   assert.equal(store.getState().messages[0].toolCalls[0].status, "completed");
   assert.equal(store.getState().messages[0].toolCalls[0].output, "ready");
 });
+
+test('queued messages continue on the correct thread after selecting another chat', async () => {
+  reset();
+  const calls = [];
+  handler = async (method, params) => {
+    calls.push([method, params]);
+    return { turn: { id: 'next-turn' } };
+  };
+  notify('turn/started', { threadId: 'parent', turn: { id: 'first' } });
+  await store.getState().sendMessage('next', 'data:image/png;base64,FULL');
+  assert.equal(calls.length, 0);
+  store.setState({ currentThreadId: 'other', messages: [], isStreaming: false });
+  notify('turn/completed', { threadId: 'parent', turn: { id: 'first', status: 'completed' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls[0][0], 'turn/start');
+  assert.equal(calls[0][1].threadId, 'parent');
+  assert.equal(calls[0][1].input[1].url, 'data:image/png;base64,FULL');
+  assert.deepEqual(store.getState().messages, []);
+  assert.equal(store.getState().isStreaming, false);
+});
+
+test('steer uses expectedTurnId and preserves the draft on rejection', async () => {
+  reset();
+  const calls = [];
+  handler = async (method, params) => { calls.push([method, params]); return { turnId: 'active' }; };
+  notify('turn/started', { threadId: 'parent', turn: { id: 'active' } });
+  await store.getState().sendMessage('guide', null, 'steer');
+  assert.equal(calls[0][0], 'turn/steer');
+  assert.equal(calls[0][1].expectedTurnId, 'active');
+  assert.equal(store.getState().isStreaming, true);
+  handler = async () => { throw new Error('turn changed'); };
+  await assert.rejects(store.getState().sendMessage('rejected guide', null, 'steer'), /turn changed/);
+  assert.equal(store.getState().messages.some(m => m.content === 'rejected guide'), false);
+});
+
+test('late history cannot resurrect a completed active turn', async () => {
+  reset();
+  let history;
+  handler = async method => {
+    if (method === 'thread/resume') return { thread: { status: { type: 'active' } } };
+    return new Promise(resolve => { history = resolve; });
+  };
+  const switching = store.getState().switchThread('parent');
+  await new Promise(resolve => setImmediate(resolve));
+  notify('turn/started', { threadId: 'parent', turn: { id: 'finished' } });
+  notify('turn/completed', { threadId: 'parent', turn: { id: 'finished', status: 'completed' } });
+  history({ data: [{ id: 'finished', status: 'inProgress', items: [] }], nextCursor: null });
+  await switching;
+  assert.equal(store.getState().isStreaming, false);
+  assert.equal(store.getState().runs.parent.turnId, null);
+});

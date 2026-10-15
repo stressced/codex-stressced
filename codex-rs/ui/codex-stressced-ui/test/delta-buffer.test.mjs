@@ -1,0 +1,23 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { loadSource } from './bundle.mjs';
+const { DeltaBuffer } = await loadSource('../src/deltaBuffer.ts');
+test('bursts commit once per frame and final flush preserves exact content and item order', () => {
+  const commits = [];
+  let frame;
+  let cancelled = 0;
+  const buffer = new DeltaBuffer(events => commits.push(events), fn => { frame = fn; return () => cancelled++; });
+  for (const delta of ['Hola ', '🌎', '\n', '```ts\n', 'x\n```']) buffer.push('item/agentMessage/delta', { threadId: 'a', itemId: 'one', delta });
+  buffer.push('item/agentMessage/delta', { threadId: 'b', itemId: 'one', delta: 'separate' });
+  assert.equal(commits.length, 0);
+  frame();
+  assert.equal(commits.length, 1);
+  assert.equal(commits[0][0].params.delta, 'Hola 🌎\n```ts\nx\n```');
+  assert.equal(commits[0][1].params.delta, 'separate');
+  buffer.push('item/agentMessage/delta', { threadId: 'a', itemId: 'one', delta: 'final' });
+  buffer.flush();
+  frame();
+  assert.equal(commits.length, 2);
+  assert.equal(commits[1][0].params.delta, 'final');
+  assert.equal(cancelled, 2);
+});

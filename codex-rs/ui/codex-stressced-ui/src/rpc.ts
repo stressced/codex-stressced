@@ -9,6 +9,8 @@ type ConnectionStatusListener = (status: ConnectionState, message?: string) => v
 declare global {
   interface Window {
     CodexStressCed: {
+      connect?: () => Promise<{ state: ConnectionState; message?: string }>;
+      getConnectionStatus?: () => Promise<{ state: ConnectionState; message?: string }>;
       rpc: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
       openImageDialog: () => Promise<string | null>;
       openWorkspaceDialog: () => Promise<string | null>;
@@ -21,95 +23,60 @@ declare global {
   }
 }
 
-class RpcClient {
-  private _connectionStatus: ConnectionState = "connecting";
-  private _error: string | null = null;
-  private statusListeners = new Set<ConnectionStatusListener>();
-  private notifyListeners = new Set<NotifyListener>();
+let status: ConnectionState = "connecting";
+let error: string | null = null;
+let initialized = false;
+const listeners = new Set<ConnectionStatusListener>();
+let revision = 0;
 
-  get connectionStatus(): ConnectionState {
-    return this._connectionStatus;
-  }
-
-  get lastError(): string | null {
-    return this._error;
-  }
-
-  init() {
-    if (!window.CodexStressCed) {
-      this.setStatus("error", "Codex Stressced API not available (not running in Electron)");
-      return;
-    }
-
-    window.CodexStressCed.onConnectionStatus((status: ConnectionState, message?: string) => {
-      this.setStatus(status, message);
-    });
-  }
-
-  private setStatus(status: ConnectionState, message?: string) {
-    this._connectionStatus = status;
-    if (status === "error") {
-      this._error = message ?? "Unknown error";
-    } else if (status === "connected") {
-      this._error = null;
-    }
-    for (const fn of this.statusListeners) {
-      try { fn(status, message); } catch { /* ignore */ }
-    }
-  }
-
-  rpc<T>(method: string, params?: Record<string, unknown>): Promise<T> {
-    if (!window.CodexStressCed) {
-      return Promise.reject(new Error("Codex Stressced API not available"));
-    }
-    return window.CodexStressCed.rpc(method, params).then((v) => {
-      // If main process wrapped an error, throw it so store.ts can catch it.
-      if (
-        typeof v === "object" &&
-        v !== null &&
-        "__rpc_error" in v &&
-        v.__rpc_error === true
-      ) {
-        const msg = "message" in v && typeof v.message === "string" ? v.message : "RPC error";
-        throw new Error(msg);
-      }
-      return v as T;
-    });
-  }
-
-  onNotification(fn: NotifyListener): () => void {
-    if (!window.CodexStressCed) return () => {};
-    return window.CodexStressCed.onNotification(fn);
-  }
-
-  onConnectionStatus(fn: ConnectionStatusListener): () => void {
-    if (!window.CodexStressCed) return () => {};
-    return window.CodexStressCed.onConnectionStatus(fn);
-  }
+function setStatus(next: ConnectionState, message?: string) {
+  revision++;
+  status = next;
+  error = next === "error" ? message ?? "Connection error" : null;
+  for (const listener of listeners) listener(next, message);
 }
 
-const client = new RpcClient();
+function init() {
+  if (initialized) return;
+  const api = window.CodexStressCed;
+  if (!api) { setStatus("error", "Codex Stressced API unavailable"); return; }
+  initialized = true;
+  api.onConnectionStatus?.(setStatus);
+  const version = revision;
+  void api.getConnectionStatus?.().then(snapshot => {
+    if (revision === version) setStatus(snapshot.state, snapshot.message);
+  });
+}
 
 export async function ensureConnected(): Promise<void> {
-  // Connection is managed by main process; ensureConnected is a no-op but we expose status.
+  init();
+  const snapshot = await window.CodexStressCed?.connect?.();
+  if (snapshot) {
+    setStatus(snapshot.state, snapshot.message);
+    if (snapshot.state !== "connected") throw new Error(snapshot.message ?? "Connection unavailable");
+  }
 }
 
-export function rpc<T>(method: string, params?: Record<string, unknown>): Promise<T> {
-  return client.rpc<T>(method, params);
+export async function rpc<T>(method: string, params?: Record<string, unknown>): Promise<T> {
+  const api = window.CodexStressCed;
+  if (!api) throw new Error("Codex Stressced API unavailable");
+  const result = await api.rpc(method, params);
+  if (result && typeof result === "object" && "__rpc_error" in result) {
+    throw new Error("message" in result ? String(result.message) : "RPC error");
+  }
+  return result as T;
 }
 
 export function onNotification(fn: NotifyListener): () => void {
-  return client.onNotification(fn);
+  return window.CodexStressCed?.onNotification?.(fn) ?? (() => {});
 }
 
 export function onConnectionStatus(fn: ConnectionStatusListener): () => void {
-  return client.onConnectionStatus(fn);
+  listeners.add(fn);
+  init();
+  fn(status, error ?? undefined);
+  return () => { listeners.delete(fn); };
 }
 
-export function getConnectionStatus(): ConnectionState {
-  return client.connectionStatus;
-}
-
-export function getLastError(): string | null {
-  return client.lastError;
-}
+export function getConnectionStatus(): ConnectionState { return status; }
+export function getLastError(): string | null { return error; }

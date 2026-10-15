@@ -100,3 +100,76 @@ versionan en el repositorio.
 - SHA-256: `FC2997277CF1C83E6734897CE8C3F2527891A7BF75C5F09E6474F6DDC9D72FAA`.
 - La versión visible continúa en `0.1.0`: esta selección toma `rust-v0.152.0` como
   referencia técnica, pero no declara que todo el fork sea Codex CLI 0.152.0.
+
+## Electron: queue, steer y conexión — 2026-10-14
+
+- Enter/Send encola durante un turno; Steer utiliza `turn/steer` con
+  `expectedTurnId`. Stop interrumpe y pausa la cola. Los pendientes se pueden
+  editar o quitar, conservan adjuntos y pertenecen a su conversación aunque se
+  seleccione otra. La cola vive en memoria: sobrevive a reconexiones, pero no a
+  cerrar la aplicación. Después de una desconexión se reanuda explícitamente.
+- Las solicitudes esperan la apertura del WebSocket y el handshake completo.
+  Hay reconexión con espera progresiva, rechazo inmediato de solicitudes
+  pendientes al desconectar y recuperación del estado inicial del renderer.
+  No se reenvían mutaciones automáticamente cuando su entrega es incierta.
+  Si el puerto habitual está ocupado y no responde, se usa otro puerto local
+  sin terminar procesos ajenos. Los errores del backend se registran también
+  sin activar los logs de depuración.
+- Los deltas se agrupan por cuadro y se vacían antes de eventos de finalización.
+  Se eliminó el límite de 200 ms del Markdown; el historial y sus filas se
+  renderizan independientemente del compositor. El autoscroll sigue el DOM
+  actualizado y el compositor recalcula su altura al cambiar de ancho.
+- Validación: TypeScript, 32 pruebas Node, siete estados nuevos en el snapshot
+  `insta` existente (comparados también desde Node), prueba interactiva de
+  Queue/Steer/Stop/edición y handshake + `thread/list` con el backend real en un
+  puerto aislado. Replay de unos 6 KB con código y tablas: aproximadamente
+  60 actualizaciones/s, render medio de 5.7 ms y máximo de 12.3 ms en esta máquina.
+  Son medidas de la interfaz con datos simulados, no de inferencia de Qwen.
+- No hubo cambios en Rust ni se repitió su suite global. El portable incluye
+  el backend previamente validado, extraído del artefacto anterior cuyo SHA-256
+  coincide con el registrado arriba. Frontend, preload, main y backend del
+  paquete se comprobaron byte a byte contra los archivos de compilación.
+
+Portable Full: `D:\codex-selective-upgrade-work\2026-10-14\Codex Stressced Full 0.1.0.exe`.
+Tamaño: 137,394,480 bytes. SHA-256:
+`8039580369B9A9240C8880359B4CFD1787F4F98597B36FAE5B191AA76275C5FF`.
+Los archivos generados de compilación se movieron a `build-cache` junto al
+portable, fuera del repositorio, tras el bloqueo automático de su eliminación.
+
+## Electron: wrappers del portable y diagnóstico de Computer Use — 2026-10-15
+
+Sesión revisada: `01a140c8-0eb0-7eb1-9138-daed260168fe`, con Qwen3.6
+35B A3B. Se completaron tres turnos, sin compactación ni errores de transporte
+MCP registrados. Computer Use devolvió capturas de 2560×1440.
+
+- El wrapper local `APPLY_PATCH` existía, pero falló al resolver el ejecutable:
+  sus rutas de respaldo apuntaban a directorios de compilación ya retirados.
+  Electron ahora exporta `CODEXSTRESSCED_EXE` con la ruta absoluta del backend
+  que inicia, también si se selecciona un binario personalizado. El wrapper y
+  los shells heredan esa ruta; ya no dependen del árbol de compilación. No se
+  modifica el guard de borrado ni la configuración personal del usuario.
+- Las acciones inválidas de Computer Use se rechazan antes de consultar
+  coordenadas/pantalla y reciben las acciones disponibles y un ejemplo de
+  `click`. En la sesión el modelo había enviado `left_click` y luego corrigió
+  su llamada. No se agregan alias ni acciones automáticas.
+- Otros errores observados: índices incorrectos de `Substring`, parámetros
+  `-LiteralPath` sin argumento y una edición grande que Safe Edit rechazó antes
+  de aceptar el reintento explícito. Los errores de PowerShell podían aparecer
+  junto a exit code 0 por comandos posteriores; el log no acredita éxito de
+  esas operaciones. Son fallos en los comandos del modelo, no una razón para
+  relajar protecciones ni cambiar la semántica general de PowerShell.
+- Validación: TypeScript y 35 pruebas Node aprobadas. El smoke test con backend
+  real usa un CODEX_HOME y puerto aislados; `command/exec` hereda el entorno,
+  llama al mismo `apply_patch.bat` de la sesión y crea/elimina un JSON temporal
+  mediante parches, verificando códigos de salida, contenido y existencia.
+  No usa inferencia ni modifica el sitio web del usuario. No hay cambios Rust.
+- La ruta se proporciona al backend iniciado por esta versión. Para usarla,
+  cerrar la versión anterior y abrir el nuevo portable. Un app-server externo
+  iniciado manualmente conserva su propio entorno y no se modifica al conectar.
+
+Portable Full: `D:\codex-selective-upgrade-work\2026-10-15\Codex Stressced Full 0.1.0.exe`.
+Tamaño: 137,396,232 bytes. SHA-256:
+`A549BE92C2AFA34D78B1999150550BAE7C2FF298C83B20572C3A6D3EE3DFBFB5`.
+Se verificaron los siete archivos de frontend/main/preload del paquete contra
+los compilados y el hash del backend sin cambios. Los directorios generados
+se conservaron fuera del repo, en `build-cache` y `release-full` junto al portable.
